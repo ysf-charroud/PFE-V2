@@ -12,8 +12,8 @@ MODEL_DIR = os.environ.get(
 FORCE_CPU = os.environ.get("FORCE_CPU", "false").lower() == "true"
 # EasyOCR expects a list of language codes e.g. ["en"] or ["en", "fr"]
 OCR_LANGS = [l.strip() for l in os.environ.get("OCR_LANG", "en").split(",")]
-OCR_MIN_CONFIDENCE = float(os.environ.get("OCR_MIN_CONFIDENCE", "0.5"))
-OCR_UPSCALE_TO = int(os.environ.get("OCR_UPSCALE_TO", "1600"))
+OCR_MIN_CONFIDENCE = float(os.environ.get("OCR_MIN_CONFIDENCE", "0.3"))
+OCR_UPSCALE_TO = int(os.environ.get("OCR_UPSCALE_TO", "2000"))
 
 
 class ModelBundle:

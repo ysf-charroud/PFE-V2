@@ -67,23 +67,20 @@ def _deskew(gray: np.ndarray) -> np.ndarray:
 
 
 def _preprocess_for_ocr(image: Image.Image) -> np.ndarray:
-    """Full OCR preprocessing pipeline — only affects EasyOCR, not LayoutLMv3.
+    """OCR preprocessing pipeline — only affects EasyOCR input, not LayoutLMv3.
 
     1. Grayscale
     2. CLAHE  — local contrast boost (helps Canny for deskew)
     3. Deskew — Hough-line skew correction for angled phone photos
-    4. Unsharp mask — edge sharpening after orientation is fixed
-    5. Gaussian blur — smooth before threshold to avoid character artifacts
-    6. Otsu threshold — binarize
+
+    Deliberately stops at grayscale: EasyOCR's CRAFT detector is a neural net that
+    does its own internal preprocessing — binarization destroys the contrast gradients
+    it relies on for text region detection.
     """
     gray = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
-    corrected = _deskew(enhanced)
-    sharp = cv2.addWeighted(corrected, 1.5, cv2.GaussianBlur(corrected, (0, 0), 3), -0.5, 0)
-    blurred = cv2.GaussianBlur(sharp, (3, 3), 0)
-    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return binary
+    return _deskew(enhanced)
 
 
 def _upscale_if_needed(image: Image.Image) -> Image.Image:
@@ -92,7 +89,7 @@ def _upscale_if_needed(image: Image.Image) -> Image.Image:
         return image
     w, h = image.size
     if max(w, h) < target:
-        scale = min(target / max(w, h), 2.0)
+        scale = min(target / max(w, h), 8.0)
         image = image.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
     return image
 
@@ -113,7 +110,13 @@ def predict(image: Image.Image) -> dict:
     # --- Step 1: EasyOCR ---
     # Returns: [(quad, text, confidence), ...]
     # quad = [[x1,y1],[x2,y1],[x2,y2],[x1,y2]]
-    ocr_result = ocr.readtext(_preprocess_for_ocr(ocr_image))
+    ocr_result = ocr.readtext(
+        _preprocess_for_ocr(ocr_image),
+        text_threshold=0.4,   # lower = detect fainter text
+        low_text=0.3,         # lower = detect smaller/lighter chars
+        link_threshold=0.4,   # keep default — lowering this merges rows into one region
+        min_size=10,
+    )
 
     words, boxes = [], []
     for (quad, text, conf) in ocr_result:

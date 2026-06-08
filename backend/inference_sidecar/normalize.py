@@ -54,6 +54,9 @@ def _parse_number(raw: str):
     s = re.sub(r'[^\d.,]', '', raw.strip())
     if not s:
         return None
+    # Collapse repeated separators from OCR artifacts (e.g. "36,,300" → "36,300")
+    s = re.sub(r',{2,}', ',', s)
+    s = re.sub(r'\.{2,}', '.', s)
     if re.fullmatch(r'\d{1,3}(\.\d{3})+', s):          # 23.000 / 1.234.567  (dot-thousands)
         return float(s.replace('.', ''))
     if re.fullmatch(r'\d{1,3}(,\d{3})+', s):           # 33,000 / 1,234,567  (comma-thousands)
