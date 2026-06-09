@@ -1,3 +1,4 @@
+import re
 from collections import Counter, defaultdict
 
 import cv2
@@ -20,34 +21,72 @@ def _normalize_box(pts, width, height):
     return [x0, y0, x1, y1]
 
 
+# Two concatenated amounts with thousand separators, e.g. "110,00070,000".
+_DOUBLE_AMOUNT = re.compile(r"^(\d{1,3}[.,]\d{3})(\d{1,3}[.,]\d{3,})$")
+# Letter↔digit transition, e.g. "RE216000" → "RE" + "216000".
+_ALNUM_SPLIT = re.compile(r"(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])")
+
+
+def _atomize(text: str):
+    """Split a phrase into atomic tokens so column-mashed OCR can be salvaged.
+
+    Splits on:
+      1. whitespace (default)
+      2. letter↔digit transitions  ("RE216000" → "RE", "216000")
+      3. two concatenated amounts   ("110,00070,000" → "110,000", "70,000")
+      4. long pure-digit runs       ("111000222000" → "111000", "222000")
+    """
+    out = []
+    for tok in text.split():
+        for part in _ALNUM_SPLIT.split(tok):
+            if not part:
+                continue
+            m = _DOUBLE_AMOUNT.match(part)
+            if m:
+                out.append(m.group(1))
+                out.append(m.group(2))
+                continue
+            if part.isdigit() and len(part) >= 10:
+                mid = len(part) // 2
+                out.append(part[:mid])
+                out.append(part[mid:])
+                continue
+            out.append(part)
+    return out
+
+
 def _split_phrase(text, box):
-    """EasyOCR returns phrase-level boxes. Split into per-word boxes proportionally
-    by character count — CORD training data used per-word boxes, so inference must too."""
-    toks = text.split()
+    """PaddleOCR returns phrase-level boxes. Split into per-word/per-amount boxes
+    proportionally by character count — CORD training data used per-word boxes."""
+    toks = _atomize(text)
     if len(toks) <= 1:
         return [(text, box)]
     x1, y1, x2, y2 = box
     span = max(1, x2 - x1)
-    total = sum(len(t) for t in toks) + (len(toks) - 1)  # chars + spaces
+    total = sum(len(t) for t in toks) + (len(toks) - 1)
     out, pos = [], 0
     for t in toks:
         wx1 = int(x1 + span * pos / total)
         pos += len(t)
         wx2 = int(x1 + span * pos / total)
-        pos += 1  # account for space
+        pos += 1
         out.append((t, [wx1, y1, max(wx1, wx2), y2]))
     return out
 
 
-def _deskew(gray: np.ndarray) -> np.ndarray:
-    """Detect dominant near-horizontal line angle and rotate to correct skew."""
+def _deskew(image: Image.Image) -> Image.Image:
+    """Detect dominant near-horizontal line angle via Hough lines and rotate to
+    correct. No-op for images that are already straight (< 0.5°) or have too
+    few line features to estimate confidently."""
+    arr = np.array(image)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
     edges = cv2.Canny(gray, 50, 150, apertureSize=3)
     lines = cv2.HoughLinesP(
         edges, 1, np.pi / 180, threshold=80,
         minLineLength=gray.shape[1] // 5, maxLineGap=20,
     )
     if lines is None or len(lines) < 3:
-        return gray
+        return image
     angles = []
     for line in lines:
         x1, y1, x2, y2 = line[0]
@@ -56,42 +95,25 @@ def _deskew(gray: np.ndarray) -> np.ndarray:
             if abs(a) < 45:
                 angles.append(a)
     if not angles:
-        return gray
+        return image
     angle = float(np.median(angles))
     if abs(angle) < 0.5:
-        return gray
-    h, w = gray.shape
-    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-    return cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC,
-                          borderMode=cv2.BORDER_REPLICATE)
+        return image
+    return image.rotate(angle, resample=Image.BICUBIC, fillcolor=(255, 255, 255))
 
 
-def _preprocess_for_ocr(image: Image.Image) -> np.ndarray:
-    """OCR preprocessing pipeline — only affects EasyOCR input, not LayoutLMv3.
-
-    1. Grayscale
-    2. CLAHE  — local contrast boost (helps Canny for deskew)
-    3. Deskew — Hough-line skew correction for angled phone photos
-
-    Deliberately stops at grayscale: EasyOCR's CRAFT detector is a neural net that
-    does its own internal preprocessing — binarization destroys the contrast gradients
-    it relies on for text region detection.
-    """
-    gray = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-    return _deskew(enhanced)
-
-
-def _upscale_if_needed(image: Image.Image) -> Image.Image:
+def _upscale_if_needed(image: Image.Image):
+    """Receipts shot at <2000px long side hurt PaddleOCR detection. Lanczos
+    upscale so the long side hits OCR_UPSCALE_TO."""
     target = bundle.ocr_upscale_to
     if target <= 0:
         return image
     w, h = image.size
-    if max(w, h) < target:
-        scale = min(target / max(w, h), 8.0)
-        image = image.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-    return image
+    long_side = max(w, h)
+    if long_side >= target:
+        return image
+    scale = min(target / long_side, 4.0)
+    return image.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
 
 def predict(image: Image.Image) -> dict:
@@ -101,29 +123,24 @@ def predict(image: Image.Image) -> dict:
     id2label = model.config.id2label
 
     image = image.convert("RGB")
-    ocr_image = _upscale_if_needed(image)
-    width, height = image.size
-    ocr_w, ocr_h = ocr_image.size
-    scale_x = width / ocr_w
-    scale_y = height / ocr_h
+    # Deskew BEFORE everything else so OCR boxes and LayoutLMv3 visual features
+    # share the same coordinate frame.
+    image = _deskew(image)
 
-    # --- Step 1: EasyOCR ---
-    # Returns: [(quad, text, confidence), ...]
-    # quad = [[x1,y1],[x2,y1],[x2,y2],[x1,y2]]
-    ocr_result = ocr.readtext(
-        _preprocess_for_ocr(ocr_image),
-        text_threshold=0.4,   # lower = detect fainter text
-        low_text=0.3,         # lower = detect smaller/lighter chars
-        link_threshold=0.4,   # keep default — lowering this merges rows into one region
-        min_size=10,
-    )
+    ocr_image = _upscale_if_needed(image)
+    ocr_w, ocr_h = ocr_image.size
+    img_arr = np.array(ocr_image)
+
+    # --- Step 1: PaddleOCR ---
+    ocr_result = ocr.ocr(img_arr, cls=True)
+    lines = ocr_result[0] if ocr_result and ocr_result[0] else []
 
     words, boxes = [], []
-    for (quad, text, conf) in ocr_result:
+    for entry in lines:
+        quad, (text, conf) = entry[0], entry[1]
         if conf < bundle.ocr_min_confidence or not text.strip():
             continue
-        scaled = [[p[0] * scale_x, p[1] * scale_y] for p in quad]
-        norm_box = _normalize_box(scaled, width, height)
+        norm_box = _normalize_box(quad, ocr_w, ocr_h)
         for wtext, wbox in _split_phrase(text.strip(), norm_box):
             words.append(wtext)
             boxes.append(wbox)
@@ -180,7 +197,7 @@ def predict(image: Image.Image) -> dict:
         for i, (w, b) in enumerate(zip(words, boxes))
     ]
 
-    # --- Step 5a: Flat fields dict (all non-O labels, for convenience) ---
+    # --- Step 5a: Flat fields dict ---
     flat = defaultdict(list)
     for item in word_list:
         if item["label"] != "O":
@@ -188,7 +205,6 @@ def predict(image: Image.Image) -> dict:
     fields = {k: " ".join(v) for k, v in flat.items()}
 
     # --- Step 5b: Spatial row clustering ---
-    # Sort labeled words by y-centre then x so we process top-to-bottom, left-to-right
     labeled_idxs = [i for i, item in enumerate(word_list) if item["label"] != "O"]
     labeled_idxs.sort(key=lambda i: (
         (boxes[i][1] + boxes[i][3]) / 2,
@@ -199,8 +215,7 @@ def predict(image: Image.Image) -> dict:
     for i in labeled_idxs:
         yc = (boxes[i][1] + boxes[i][3]) / 2
         h = max(1, boxes[i][3] - boxes[i][1])
-        # Words within 60% of one line-height of the previous centre → same row
-        if last_yc is None or abs(yc - last_yc) <= max(8, h * 0.6):
+        if last_yc is None or abs(yc - last_yc) <= max(5, h * 0.5):
             cur.append(i)
         else:
             rows.append(cur)
@@ -211,16 +226,10 @@ def predict(image: Image.Image) -> dict:
 
     line_items, summary = [], {}
     for row in rows:
-        texts, confs = defaultdict(list), defaultdict(list)
-        for i in sorted(row, key=lambda j: boxes[j][0]):  # left-to-right within row
-            lbl = word_list[i]["label"]
-            texts[lbl].append(word_list[i]["text"])
-            confs[lbl].append(word_list[i]["conf"])
-        # Each field carries its joined text and the mean confidence of its words.
-        row_fields = {
-            k: {"text": " ".join(texts[k]), "conf": float(np.mean(confs[k]))}
-            for k in texts
-        }
+        row_fields = defaultdict(list)
+        for i in sorted(row, key=lambda j: boxes[j][0]):
+            row_fields[word_list[i]["label"]].append(word_list[i]["text"])
+        row_fields = {k: " ".join(v) for k, v in row_fields.items()}
         if any(k.startswith("menu") for k in row_fields):
             line_items.append(row_fields)
         else:

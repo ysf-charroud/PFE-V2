@@ -3,6 +3,8 @@ uvicorn[standard]>=0.30
 python-multipart>=0.0.9
 torch>=2.0
 transformers>=4.30
-easyocr>=1.7
+paddleocr>=2.10
+paddlepaddle>=2.6
+opencv-python>=4.5
 Pillow
 numpy
