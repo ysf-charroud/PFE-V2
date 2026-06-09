@@ -42,3 +42,5 @@ desktop.ini
 # --- Model artifacts ---
 model/
 data/
+
+cord_layoutlmv3/

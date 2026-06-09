@@ -148,17 +148,16 @@ function TopNav() {
           <div className="flex items-center gap-6">
             {link("/", "Documents")}
             {link("/models", "Models")}
-            {link("/logs", "Logs")}
           </div>
         </div>
-        <div className="flex items-center gap-3">
+        {/* <div className="flex items-center gap-3">
           <button className="text-sm font-medium px-3 py-1.5 rounded-md bg-secondary text-secondary-foreground ring-1 ring-border hover:bg-muted transition-colors">
             Export JSON
           </button>
           <button className="text-sm font-semibold px-3 py-1.5 rounded-md bg-brand text-brand-foreground ring-1 ring-brand hover:opacity-90 transition-opacity">
             New Upload
           </button>
-        </div>
+        </div> */}
       </div>
     </nav>
   );
