@@ -96,29 +96,55 @@ def _coerce(clean_key: str, raw_value: str):
     return raw_value.strip() or None
 
 
+def _cell(raw_value):
+    """A field cell is {'text': str, 'conf': float}. Returns (text, conf)."""
+    if isinstance(raw_value, dict):
+        return raw_value.get("text", ""), float(raw_value.get("conf", 0.0))
+    return raw_value, None  # backward-compatible with plain-string cells
+
+
 def normalize(raw: dict) -> dict:
     receipt = {}
 
     clean_items = []
     for row in raw.get("line_items", []):
-        item = {}
-        for cord_label, raw_value in row.items():
+        item, item_conf = {}, {}
+        for cord_label, cell in row.items():
             clean_key = _LINE_ITEM_FIELDS.get(cord_label)
-            if clean_key is None or _is_noise(raw_value):
+            text, conf = _cell(cell)
+            if clean_key is None or _is_noise(text):
                 continue
-            value = _coerce(clean_key, raw_value)
+            value = _coerce(clean_key, text)
             if value is not None:
                 item[clean_key] = value
+                if conf is not None:
+                    item_conf[clean_key] = round(conf, 3)
         if "name" in item or "price" in item:
+            if item_conf:
+                item["confidence"] = item_conf
             clean_items.append(item)
     receipt["line_items"] = clean_items
 
-    for cord_label, raw_value in raw.get("summary", {}).items():
+    field_conf = {}
+    for cord_label, cell in raw.get("summary", {}).items():
         clean_key = _SUMMARY_FIELDS.get(cord_label)
-        if clean_key is None or _is_noise(raw_value):
+        text, conf = _cell(cell)
+        if clean_key is None or _is_noise(text):
             continue
-        value = _coerce(clean_key, raw_value)
+        value = _coerce(clean_key, text)
         if value is not None and clean_key not in receipt:
             receipt[clean_key] = value
+            if conf is not None:
+                field_conf[clean_key] = round(conf, 3)
+    if field_conf:
+        receipt["field_confidence"] = field_conf
+
+    # Overall confidence = mean of every detected field's confidence
+    # (summary fields + each line-item field).
+    all_confs = list(field_conf.values())
+    for it in clean_items:
+        all_confs.extend(it.get("confidence", {}).values())
+    if all_confs:
+        receipt["overall_confidence"] = round(sum(all_confs) / len(all_confs), 3)
 
     return receipt

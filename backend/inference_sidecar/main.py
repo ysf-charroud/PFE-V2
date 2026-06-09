@@ -6,6 +6,7 @@ or:
     python -m uvicorn main:app --port 8001
 """
 import io
+import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -25,6 +26,8 @@ OUTPUT_DIR = os.environ.get(
     os.path.join(_HERE, "..", "storage", "annotated"),
 )
 
+METRICS_PATH = os.environ.get("METRICS_PATH", os.path.join(_HERE, "metrics.json"))
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -38,6 +41,15 @@ app = FastAPI(title="Inference Sidecar", version="0.1.0", lifespan=lifespan)
 @app.get("/health")
 def health():
     return {"status": "ok", "model_loaded": bundle.is_loaded, "device": bundle.device_str}
+
+
+@app.get("/metrics")
+def metrics():
+    """Evaluation metrics produced by evaluate.py (CORD test split)."""
+    if not os.path.exists(METRICS_PATH):
+        return {"available": False, "detail": "Run evaluate.py to generate metrics."}
+    with open(METRICS_PATH) as f:
+        return {"available": True, **json.load(f)}
 
 
 @app.post("/infer")

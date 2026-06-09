@@ -56,3 +56,14 @@ export async function predict(imageBuffer, filename, annotate = true) {
 
   return res.json();
 }
+
+/** Fetch evaluation metrics (CORD test split) from the sidecar. */
+export async function getMetrics() {
+  const res = await fetch(`${config.sidecarUrl}/metrics`);
+  if (!res.ok) {
+    const err = new Error('Failed to fetch metrics from sidecar');
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}

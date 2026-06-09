@@ -1,0 +1,6 @@
+# Extra dependencies for evaluate.py (model evaluation on the CORD test split).
+# Not needed to serve inference — install only when regenerating metrics.json:
+#   .venv/bin/pip install -r requirements-eval.txt
+#   MODEL_DIR=/abs/path/to/cord_layoutlmv3 .venv/bin/python evaluate.py
+datasets>=2.0
+scikit-learn>=1.0

@@ -1,8 +1,18 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import invoiceScan from "@/assets/invoice-scan.jpg";
-import { extractReceipt, getHealth, resolveApiUrl, type ExtractResponse } from "@/lib/api";
+import {
+  extractReceipt,
+  getHealth,
+  listDocuments,
+  resolveApiUrl,
+  saveCorrection,
+  type ExtractResponse,
+  type LineItem,
+  type Receipt,
+  type SavedDocument,
+} from "@/lib/api";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -21,21 +31,166 @@ export const Route = createFileRoute("/")({
 const fmt = (n?: number | null) =>
   n == null ? "—" : n.toLocaleString(undefined, { maximumFractionDigits: 2 });
 
+/** Mean of a per-field confidence map, or null if empty. */
+function meanConfidence(conf?: Record<string, number>): number | null {
+  if (!conf) return null;
+  const vals = Object.values(conf);
+  if (vals.length === 0) return null;
+  return vals.reduce((a, b) => a + b, 0) / vals.length;
+}
+
+// --- Editable form model -------------------------------------------------
+// Fields are edited as strings (free typing, incl. partial decimals) and
+// coerced back to a clean Receipt only when saving.
+
+type DraftItem = {
+  name: string;
+  sub_name: string;
+  quantity: string;
+  unit_price: string;
+  price: string;
+  discount: string;
+};
+
+type Draft = {
+  items: DraftItem[];
+  subtotal: string;
+  discount: string;
+  service_charge: string;
+  tax: string;
+  total: string;
+  cash_paid: string;
+  change: string;
+  credit_card: string;
+};
+
+const s = (n?: number | string | null) => (n == null ? "" : String(n));
+
+function num(v: string): number | undefined {
+  const t = v.trim();
+  if (t === "") return undefined;
+  const n = Number(t.replace(/,/g, ""));
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function toDraft(r: Receipt): Draft {
+  return {
+    items: (r.line_items ?? []).map((it) => ({
+      name: s(it.name),
+      sub_name: s(it.sub_name),
+      quantity: s(it.quantity),
+      unit_price: s(it.unit_price),
+      price: s(it.price),
+      discount: s(it.discount),
+    })),
+    subtotal: s(r.subtotal),
+    discount: s(r.discount),
+    service_charge: s(r.service_charge),
+    tax: s(r.tax),
+    total: s(r.total),
+    cash_paid: s(r.cash_paid),
+    change: s(r.change),
+    credit_card: s(r.credit_card),
+  };
+}
+
+function fromDraft(d: Draft): Receipt {
+  const r: Receipt = {
+    line_items: d.items.map((it) => {
+      const item: LineItem = {};
+      if (it.name.trim()) item.name = it.name.trim();
+      if (it.sub_name.trim()) item.sub_name = it.sub_name.trim();
+      if (num(it.quantity) != null) item.quantity = num(it.quantity);
+      if (num(it.unit_price) != null) item.unit_price = num(it.unit_price);
+      if (num(it.price) != null) item.price = num(it.price);
+      if (num(it.discount) != null) item.discount = num(it.discount);
+      return item;
+    }),
+  };
+  const summary: [keyof Draft, keyof Receipt][] = [
+    ["subtotal", "subtotal"],
+    ["discount", "discount"],
+    ["service_charge", "service_charge"],
+    ["tax", "tax"],
+    ["total", "total"],
+    ["cash_paid", "cash_paid"],
+    ["change", "change"],
+    ["credit_card", "credit_card"],
+  ];
+  for (const [dk, rk] of summary) {
+    const v = num(d[dk] as string);
+    if (v != null) (r as Record<string, unknown>)[rk] = v;
+  }
+  return r;
+}
+
+// --- Unified view model over a fresh extraction or a persisted document ---
+
+type DocView = {
+  id: number;
+  filename: string;
+  receipt: Receipt; // original model output (for confidence display)
+  corrected: Receipt | null;
+  num_words: number;
+  processing_ms: number;
+  annotated_image_url: string | null;
+  reviewed: boolean;
+};
+
+function viewFromExtract(r: ExtractResponse): DocView {
+  return {
+    id: r.id,
+    filename: r.filename,
+    receipt: r.receipt,
+    corrected: null,
+    num_words: r.num_words,
+    processing_ms: r.processing_ms,
+    annotated_image_url: r.annotated_image_url,
+    reviewed: false,
+  };
+}
+
+function viewFromSaved(d: SavedDocument): DocView {
+  return {
+    id: d.id,
+    filename: d.filename,
+    receipt: d.receipt,
+    corrected: d.corrected_receipt,
+    num_words: d.num_words ?? 0,
+    processing_ms: d.processing_ms ?? 0,
+    annotated_image_url: d.annotated_filename ? `/files/annotated/${d.annotated_filename}` : null,
+    reviewed: d.reviewed,
+  };
+}
+
 function DocumentsPage() {
+  const qc = useQueryClient();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [active, setActive] = useState<ExtractResponse | null>(null);
-  const [history, setHistory] = useState<ExtractResponse[]>([]);
+  const [active, setActive] = useState<DocView | null>(null);
+  const [draft, setDraft] = useState<Draft | null>(null);
+  const [baseline, setBaseline] = useState("");
   const [dragOver, setDragOver] = useState(false);
   const [mounted, setMounted] = useState(false);
 
   useEffect(() => setMounted(true), []);
-  // Revoke the last object URL when it changes or on unmount.
   useEffect(() => {
     return () => {
       if (previewUrl) URL.revokeObjectURL(previewUrl);
     };
   }, [previewUrl]);
+
+  // Reset the editable draft whenever the active document changes.
+  useEffect(() => {
+    if (active) {
+      const d = toDraft(active.corrected ?? active.receipt);
+      setDraft(d);
+      setBaseline(JSON.stringify(d));
+    } else {
+      setDraft(null);
+      setBaseline("");
+    }
+  }, [active]);
 
   const health = useQuery({
     queryKey: ["health"],
@@ -45,11 +200,25 @@ function DocumentsPage() {
     retry: false,
   });
 
+  const documents = useQuery({
+    queryKey: ["documents"],
+    queryFn: listDocuments,
+    enabled: mounted,
+  });
+
   const extract = useMutation({
     mutationFn: (file: File) => extractReceipt(file),
     onSuccess: (data) => {
-      setActive(data);
-      setHistory((h) => [data, ...h].slice(0, 8));
+      setActive(viewFromExtract(data));
+      qc.invalidateQueries({ queryKey: ["documents"] });
+    },
+  });
+
+  const save = useMutation({
+    mutationFn: () => saveCorrection(active!.id, fromDraft(draft!)),
+    onSuccess: (doc) => {
+      setActive(viewFromSaved(doc));
+      qc.invalidateQueries({ queryKey: ["documents"] });
     },
   });
 
@@ -62,9 +231,19 @@ function DocumentsPage() {
     extract.mutate(file);
   }
 
-  const receipt = active?.receipt;
-  const lineItems = receipt?.line_items ?? [];
+  const setItem = (i: number, key: keyof DraftItem, value: string) =>
+    setDraft((d) => {
+      if (!d) return d;
+      const items = d.items.map((it, j) => (j === i ? { ...it, [key]: value } : it));
+      return { ...d, items };
+    });
+  const setSummary = (key: keyof Draft, value: string) =>
+    setDraft((d) => (d ? { ...d, [key]: value } : d));
+
+  const base = active?.receipt;
+  const items = draft?.items ?? [];
   const displayImage = resolveApiUrl(active?.annotated_image_url) ?? previewUrl ?? invoiceScan;
+  const dirty = draft != null && JSON.stringify(draft) !== baseline;
 
   const status: "idle" | "pending" | "success" | "error" = extract.isPending
     ? "pending"
@@ -74,7 +253,8 @@ function DocumentsPage() {
         ? "success"
         : "idle";
 
-  const totalQty = lineItems.reduce((sum, it) => sum + (it.quantity ?? 0), 0);
+  const totalQty = items.reduce((sum, it) => sum + (num(it.quantity) ?? 0), 0);
+  const savedDocs = documents.data ?? [];
 
   return (
     <main className="max-w-7xl mx-auto px-6 py-8">
@@ -89,7 +269,7 @@ function DocumentsPage() {
 
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           {[
-            { label: "Documents This Session", value: String(history.length) },
+            { label: "Saved Documents", value: String(savedDocs.length) },
             {
               label: "Words Detected",
               value: active ? String(active.num_words) : "—",
@@ -100,13 +280,13 @@ function DocumentsPage() {
               value: active ? `${(active.processing_ms / 1000).toFixed(1)}s` : "—",
               mono: true,
             },
-          ].map((s) => (
-            <div key={s.label} className="p-4 bg-panel rounded-xl ring-1 ring-border">
+          ].map((stat) => (
+            <div key={stat.label} className="p-4 bg-panel rounded-xl ring-1 ring-border">
               <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-1">
-                {s.label}
+                {stat.label}
               </p>
-              <p className={`text-2xl font-medium text-foreground ${s.mono ? "font-mono" : ""}`}>
-                {s.value}
+              <p className={`text-2xl font-medium text-foreground ${stat.mono ? "font-mono" : ""}`}>
+                {stat.value}
               </p>
             </div>
           ))}
@@ -208,11 +388,7 @@ function DocumentsPage() {
             <div className="flex flex-wrap gap-4">
               {[
                 { label: "Upload", done: status !== "idle" },
-                {
-                  label: "EasyOCR Scan",
-                  done: status === "success",
-                  active: status === "pending",
-                },
+                { label: "EasyOCR Scan", done: status === "success", active: status === "pending" },
                 {
                   label: "LayoutLM Analysis",
                   done: status === "success",
@@ -238,12 +414,24 @@ function DocumentsPage() {
         {/* Extraction Panel */}
         <div className="col-span-12 lg:col-span-5 flex flex-col gap-6">
           <section className="bg-panel rounded-2xl ring-1 ring-border overflow-hidden">
-            <div className="px-6 py-4 border-b border-border flex items-center justify-between">
-              <h2 className="text-sm font-semibold text-foreground">Structured Data</h2>
+            <div className="px-6 py-4 border-b border-border flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <h2 className="text-sm font-semibold text-foreground">Structured Data</h2>
+                {active?.reviewed && (
+                  <span className="px-2 py-0.5 rounded-full bg-success/15 text-success text-[10px] font-bold uppercase tracking-wide">
+                    Reviewed
+                  </span>
+                )}
+              </div>
               {active && (
-                <span className="text-[10px] font-mono text-subtle uppercase tracking-wider">
-                  {active.num_words} words · {(active.processing_ms / 1000).toFixed(1)}s
-                </span>
+                <div className="flex items-center gap-3">
+                  {base?.overall_confidence != null && (
+                    <ConfidenceBar value={base.overall_confidence} label="conf" />
+                  )}
+                  <span className="text-[10px] font-mono text-subtle uppercase tracking-wider whitespace-nowrap">
+                    {active.num_words} words · {(active.processing_ms / 1000).toFixed(1)}s
+                  </span>
+                </div>
               )}
             </div>
 
@@ -251,9 +439,10 @@ function DocumentsPage() {
               <div className="p-6 text-sm text-destructive">
                 {(extract.error as Error)?.message ?? "Extraction failed."}
               </div>
-            ) : !active ? (
+            ) : !active || !draft ? (
               <div className="p-6 text-sm text-muted-foreground">
-                Upload a receipt to see extracted line items and totals.
+                Upload a receipt to see extracted line items and totals. Fields are editable —
+                correct any mistakes and save them back to the database.
               </div>
             ) : (
               <div className="p-6 space-y-5">
@@ -262,7 +451,7 @@ function DocumentsPage() {
                   <p className="text-[10px] font-bold text-subtle uppercase tracking-widest mb-2">
                     Document
                   </p>
-                  <Field label="File Name" value={active.filename} mono />
+                  <ReadField label="File Name" value={active.filename} mono />
                 </div>
 
                 {/* Line Items */}
@@ -270,36 +459,66 @@ function DocumentsPage() {
                   <p className="text-[10px] font-bold text-subtle uppercase tracking-widest mb-2 mt-3">
                     Line Items
                   </p>
-                  {lineItems.length === 0 ? (
+                  {items.length === 0 ? (
                     <p className="text-xs text-muted-foreground py-2">No line items detected.</p>
                   ) : (
                     <div className="overflow-x-auto">
                       <table className="w-full text-left text-sm">
                         <thead>
                           <tr className="text-[10px] font-bold text-subtle uppercase tracking-wider border-b border-border">
-                            <th className="py-2 pr-3">Item</th>
-                            <th className="py-2 pr-3 text-right">Qty</th>
-                            <th className="py-2 pr-3 text-right">Unit</th>
-                            <th className="py-2 text-right">Total</th>
+                            <th className="py-2 pr-2">Item</th>
+                            <th className="py-2 px-1 text-right">Qty</th>
+                            <th className="py-2 px-1 text-right">Unit</th>
+                            <th className="py-2 px-1 text-right">Total</th>
+                            <th className="py-2 text-right">Conf</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-border/40">
-                          {lineItems.map((item, i) => (
-                            <tr key={i}>
-                              <td className="py-2 pr-3 text-foreground font-medium">
-                                {[item.name, item.sub_name].filter(Boolean).join(" ") || "—"}
-                              </td>
-                              <td className="py-2 pr-3 text-right font-mono text-muted-foreground">
-                                {fmt(item.quantity)}
-                              </td>
-                              <td className="py-2 pr-3 text-right font-mono text-muted-foreground">
-                                {fmt(item.unit_price)}
-                              </td>
-                              <td className="py-2 text-right font-mono text-foreground">
-                                {fmt(item.price)}
-                              </td>
-                            </tr>
-                          ))}
+                          {items.map((it, i) => {
+                            const conf = meanConfidence(base?.line_items?.[i]?.confidence);
+                            return (
+                              <tr key={i}>
+                                <td className="py-1 pr-2">
+                                  <EditInput
+                                    value={it.name}
+                                    onChange={(v) => setItem(i, "name", v)}
+                                    placeholder="item name"
+                                  />
+                                </td>
+                                <td className="py-1 px-1 w-14">
+                                  <EditInput
+                                    value={it.quantity}
+                                    onChange={(v) => setItem(i, "quantity", v)}
+                                    align="right"
+                                    mono
+                                  />
+                                </td>
+                                <td className="py-1 px-1 w-20">
+                                  <EditInput
+                                    value={it.unit_price}
+                                    onChange={(v) => setItem(i, "unit_price", v)}
+                                    align="right"
+                                    mono
+                                  />
+                                </td>
+                                <td className="py-1 px-1 w-20">
+                                  <EditInput
+                                    value={it.price}
+                                    onChange={(v) => setItem(i, "price", v)}
+                                    align="right"
+                                    mono
+                                  />
+                                </td>
+                                <td className="py-1 text-right">
+                                  {conf != null ? (
+                                    <ConfidenceBar value={conf} compact />
+                                  ) : (
+                                    <span className="text-subtle">—</span>
+                                  )}
+                                </td>
+                              </tr>
+                            );
+                          })}
                         </tbody>
                       </table>
                     </div>
@@ -307,73 +526,135 @@ function DocumentsPage() {
                 </div>
 
                 {/* Totals */}
-                <div className="pt-3 border-t border-border space-y-1.5 text-sm">
-                  <TotalRow label="Items" value={String(lineItems.length)} />
-                  <TotalRow label="Total Qty" value={fmt(totalQty)} />
-                  <TotalRow label="Subtotal" value={fmt(receipt?.subtotal)} />
-                  {receipt?.discount != null && (
-                    <TotalRow label="Discount" value={fmt(receipt.discount)} />
+                <div className="pt-3 border-t border-border space-y-1 text-sm">
+                  <ReadTotalRow label="Items" value={String(items.length)} />
+                  <ReadTotalRow label="Total Qty" value={fmt(totalQty)} />
+                  <EditTotalRow
+                    label="Subtotal"
+                    value={draft.subtotal}
+                    onChange={(v) => setSummary("subtotal", v)}
+                    conf={base?.field_confidence?.subtotal}
+                  />
+                  {draft.discount !== "" && (
+                    <EditTotalRow
+                      label="Discount"
+                      value={draft.discount}
+                      onChange={(v) => setSummary("discount", v)}
+                      conf={base?.field_confidence?.discount}
+                    />
                   )}
-                  {receipt?.service_charge != null && (
-                    <TotalRow label="Service Charge" value={fmt(receipt.service_charge)} />
+                  {draft.service_charge !== "" && (
+                    <EditTotalRow
+                      label="Service Charge"
+                      value={draft.service_charge}
+                      onChange={(v) => setSummary("service_charge", v)}
+                      conf={base?.field_confidence?.service_charge}
+                    />
                   )}
-                  <TotalRow label="Tax" value={fmt(receipt?.tax)} />
-                  <div className="flex justify-between items-center pt-2 mt-2 border-t border-border">
+                  <EditTotalRow
+                    label="Tax"
+                    value={draft.tax}
+                    onChange={(v) => setSummary("tax", v)}
+                    conf={base?.field_confidence?.tax}
+                  />
+                  <div className="flex justify-between items-center pt-2 mt-2 border-t border-border gap-3">
                     <span className="text-sm font-semibold text-foreground">Grand Total</span>
-                    <span className="text-lg font-medium text-foreground font-mono tracking-tight">
-                      {fmt(receipt?.total)}
-                    </span>
+                    <div className="flex items-center gap-3">
+                      {base?.field_confidence?.total != null && (
+                        <ConfidenceBar value={base.field_confidence.total} compact />
+                      )}
+                      <input
+                        value={draft.total}
+                        onChange={(e) => setSummary("total", e.target.value)}
+                        className="w-28 bg-secondary ring-1 ring-border rounded-md px-2 py-1 text-right text-lg font-medium font-mono tracking-tight text-foreground focus:ring-brand focus:ring-2 outline-none"
+                      />
+                    </div>
                   </div>
-                  {receipt?.cash_paid != null && (
-                    <TotalRow label="Cash Tendered" value={fmt(receipt.cash_paid)} />
+                  {draft.cash_paid !== "" && (
+                    <EditTotalRow
+                      label="Cash Tendered"
+                      value={draft.cash_paid}
+                      onChange={(v) => setSummary("cash_paid", v)}
+                    />
                   )}
-                  {receipt?.change != null && (
-                    <TotalRow label="Change Due" value={fmt(receipt.change)} />
+                  {draft.change !== "" && (
+                    <EditTotalRow
+                      label="Change Due"
+                      value={draft.change}
+                      onChange={(v) => setSummary("change", v)}
+                    />
                   )}
-                  {receipt?.credit_card != null && (
-                    <TotalRow label="Credit Card" value={fmt(receipt.credit_card)} />
+                  {draft.credit_card !== "" && (
+                    <EditTotalRow
+                      label="Credit Card"
+                      value={draft.credit_card}
+                      onChange={(v) => setSummary("credit_card", v)}
+                    />
                   )}
                 </div>
+
+                {save.isError && (
+                  <p className="text-xs text-destructive">
+                    {(save.error as Error)?.message ?? "Save failed."}
+                  </p>
+                )}
               </div>
             )}
 
-            <div className="px-6 py-4 bg-secondary flex items-center justify-between">
+            <div className="px-6 py-4 bg-secondary flex items-center justify-between gap-3">
+              <div className="flex items-center gap-4">
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={extract.isPending}
+                  className="text-xs font-semibold text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
+                >
+                  {extract.isPending ? "Processing…" : "Upload Another"}
+                </button>
+                <button
+                  disabled={!active || !draft}
+                  onClick={() => {
+                    if (!active || !draft) return;
+                    const payload = { filename: active.filename, receipt: fromDraft(draft) };
+                    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+                      type: "application/json",
+                    });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `${active.filename.replace(/\.[^.]+$/, "")}.json`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                  className="text-xs font-semibold text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
+                >
+                  Export JSON
+                </button>
+              </div>
               <button
-                onClick={() => fileInputRef.current?.click()}
-                disabled={extract.isPending}
-                className="text-xs font-semibold text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
-              >
-                {extract.isPending ? "Processing…" : "Upload Another"}
-              </button>
-              <button
-                disabled={!active}
-                onClick={() => {
-                  if (!active) return;
-                  const blob = new Blob([JSON.stringify(active, null, 2)], {
-                    type: "application/json",
-                  });
-                  const url = URL.createObjectURL(blob);
-                  const a = document.createElement("a");
-                  a.href = url;
-                  a.download = `${active.filename.replace(/\.[^.]+$/, "")}.json`;
-                  a.click();
-                  URL.revokeObjectURL(url);
-                }}
+                disabled={!active || !dirty || save.isPending}
+                onClick={() => save.mutate()}
                 className="px-4 py-2 bg-brand text-brand-foreground text-xs font-semibold rounded-md shadow-sm hover:opacity-90 transition-opacity ring-1 ring-brand disabled:opacity-50"
               >
-                Export JSON
+                {save.isPending
+                  ? "Saving…"
+                  : dirty
+                    ? "Save Corrections"
+                    : active?.reviewed
+                      ? "Saved ✓"
+                      : "Save to Database"}
               </button>
             </div>
           </section>
         </div>
       </div>
 
-      {/* Session Documents Table */}
+      {/* Saved Documents Table */}
       <section className="mt-12">
         <div className="flex items-center justify-between mb-6">
-          <h2 className="text-lg font-semibold text-foreground tracking-tight">
-            Session Documents
-          </h2>
+          <h2 className="text-lg font-semibold text-foreground tracking-tight">Saved Documents</h2>
+          {documents.isFetching && (
+            <span className="text-xs text-muted-foreground">Refreshing…</span>
+          )}
         </div>
         <div className="bg-panel rounded-2xl ring-1 ring-border overflow-hidden shadow-sm">
           <table className="w-full text-left">
@@ -382,54 +663,71 @@ function DocumentsPage() {
                 <th className="px-6 py-4">Document</th>
                 <th className="px-6 py-4 text-right">Items</th>
                 <th className="px-6 py-4 text-right">Total</th>
-                <th className="px-6 py-4 text-right">Words</th>
-                <th className="px-6 py-4 text-right">Latency</th>
+                <th className="px-6 py-4 text-right">Confidence</th>
+                <th className="px-6 py-4 text-center">Status</th>
                 <th className="px-6 py-4 text-right">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border/60">
-              {history.length === 0 ? (
+              {savedDocs.length === 0 ? (
                 <tr>
                   <td colSpan={6} className="px-6 py-8 text-sm text-center text-muted-foreground">
-                    No documents processed yet this session.
+                    No documents saved yet. Upload a receipt to get started.
                   </td>
                 </tr>
               ) : (
-                history.map((d, i) => (
-                  <tr
-                    key={i}
-                    onClick={() => setActive(d)}
-                    className="hover:bg-secondary/60 transition-colors cursor-pointer group"
-                  >
-                    <td className="px-6 py-4">
-                      <div className="flex items-center gap-3">
-                        <div className="size-8 bg-surface rounded flex items-center justify-center font-mono text-[10px] text-muted-foreground uppercase">
-                          {d.filename.split(".").pop()?.slice(0, 3)}
+                savedDocs.map((d) => {
+                  const r = d.corrected_receipt ?? d.receipt;
+                  return (
+                    <tr
+                      key={d.id}
+                      onClick={() => setActive(viewFromSaved(d))}
+                      className={`hover:bg-secondary/60 transition-colors cursor-pointer group ${
+                        active?.id === d.id ? "bg-secondary/40" : ""
+                      }`}
+                    >
+                      <td className="px-6 py-4">
+                        <div className="flex items-center gap-3">
+                          <div className="size-8 bg-surface rounded flex items-center justify-center font-mono text-[10px] text-muted-foreground uppercase">
+                            {d.filename.split(".").pop()?.slice(0, 3)}
+                          </div>
+                          <span className="text-sm font-medium text-foreground group-hover:text-brand truncate max-w-[220px]">
+                            {d.filename}
+                          </span>
                         </div>
-                        <span className="text-sm font-medium text-foreground group-hover:text-brand truncate max-w-[220px]">
-                          {d.filename}
-                        </span>
-                      </div>
-                    </td>
-                    <td className="px-6 py-4 text-right text-sm font-mono text-muted-foreground">
-                      {d.receipt.line_items?.length ?? 0}
-                    </td>
-                    <td className="px-6 py-4 text-right text-sm font-mono text-foreground">
-                      {fmt(d.receipt.total)}
-                    </td>
-                    <td className="px-6 py-4 text-right text-sm font-mono text-muted-foreground">
-                      {d.num_words}
-                    </td>
-                    <td className="px-6 py-4 text-right text-sm font-mono text-muted-foreground">
-                      {(d.processing_ms / 1000).toFixed(1)}s
-                    </td>
-                    <td className="px-6 py-4 text-right">
-                      <button className="text-sm font-medium text-subtle hover:text-foreground">
-                        View
-                      </button>
-                    </td>
-                  </tr>
-                ))
+                      </td>
+                      <td className="px-6 py-4 text-right text-sm font-mono text-muted-foreground">
+                        {r.line_items?.length ?? 0}
+                      </td>
+                      <td className="px-6 py-4 text-right text-sm font-mono text-foreground">
+                        {fmt(r.total)}
+                      </td>
+                      <td className="px-6 py-4">
+                        {d.overall_confidence != null ? (
+                          <ConfidenceBar value={d.overall_confidence} />
+                        ) : (
+                          <span className="text-sm text-subtle block text-right">—</span>
+                        )}
+                      </td>
+                      <td className="px-6 py-4 text-center">
+                        {d.reviewed ? (
+                          <span className="px-2 py-0.5 rounded-full bg-success/15 text-success text-[10px] font-bold uppercase tracking-wide">
+                            Reviewed
+                          </span>
+                        ) : (
+                          <span className="px-2 py-0.5 rounded-full bg-surface text-subtle text-[10px] font-bold uppercase tracking-wide">
+                            Extracted
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-6 py-4 text-right">
+                        <button className="text-sm font-medium text-subtle hover:text-foreground">
+                          {d.reviewed ? "Review" : "Correct"}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>
@@ -439,16 +737,92 @@ function DocumentsPage() {
   );
 }
 
-function TotalRow({ label, value }: { label: string; value: string }) {
+/** Small bar visualizing a model-confidence value in [0, 1]. */
+function ConfidenceBar({
+  value,
+  label,
+  compact,
+}: {
+  value: number;
+  label?: string;
+  compact?: boolean;
+}) {
+  const pct = Math.round(value * 100);
+  const color = pct >= 90 ? "bg-success" : pct >= 70 ? "bg-warning" : "bg-destructive";
+  const text = pct >= 90 ? "text-success" : pct >= 70 ? "text-warning" : "text-destructive";
   return (
-    <div className="flex justify-between items-center">
+    <div className="flex items-center justify-end gap-1.5" title={`Model confidence: ${pct}%`}>
+      <div className={`${compact ? "w-10" : "w-14"} h-1.5 bg-surface rounded-full overflow-hidden`}>
+        <div className={`h-full ${color}`} style={{ width: `${pct}%` }} />
+      </div>
+      <span className={`text-[10px] font-mono ${text}`}>
+        {pct}%{label ? ` ${label}` : ""}
+      </span>
+    </div>
+  );
+}
+
+function EditInput({
+  value,
+  onChange,
+  align = "left",
+  mono,
+  placeholder,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  align?: "left" | "right";
+  mono?: boolean;
+  placeholder?: string;
+}) {
+  return (
+    <input
+      value={value}
+      placeholder={placeholder}
+      onChange={(e) => onChange(e.target.value)}
+      className={`w-full bg-transparent rounded px-1.5 py-1 text-sm text-foreground hover:bg-surface focus:bg-secondary focus:ring-1 focus:ring-brand outline-none ${
+        mono ? "font-mono" : "font-medium"
+      } ${align === "right" ? "text-right" : ""}`}
+    />
+  );
+}
+
+function EditTotalRow({
+  label,
+  value,
+  onChange,
+  conf,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  conf?: number | null;
+}) {
+  return (
+    <div className="flex justify-between items-center gap-3">
+      <span className="text-muted-foreground">{label}</span>
+      <div className="flex items-center gap-2">
+        {conf != null && <ConfidenceBar value={conf} compact />}
+        <input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="w-28 bg-secondary ring-1 ring-border rounded-md px-2 py-1 text-right font-mono text-sm text-foreground focus:ring-brand focus:ring-2 outline-none"
+        />
+      </div>
+    </div>
+  );
+}
+
+function ReadTotalRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex justify-between items-center py-1">
       <span className="text-muted-foreground">{label}</span>
       <span className="font-mono text-foreground">{value}</span>
     </div>
   );
 }
 
-function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+function ReadField({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
   return (
     <div>
       <label className="block text-[11px] font-bold text-subtle uppercase mb-1.5">{label}</label>

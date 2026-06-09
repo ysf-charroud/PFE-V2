@@ -148,22 +148,35 @@ def predict(image: Image.Image) -> dict:
     with torch.no_grad():
         logits = model(**encoding).logits
 
+    # Softmax over the label dimension → per-token probability distribution.
+    # probs[t, label_id] = model's confidence that token t has that label.
+    probs = logits.softmax(-1).squeeze(0).cpu().numpy()  # [seq_len, num_labels]
     predictions = logits.argmax(-1).squeeze().tolist()
     if isinstance(predictions, int):
         predictions = [predictions]
 
-    # --- Step 4: Majority vote subword → word ---
-    votes = defaultdict(list)
+    # --- Step 4: Majority vote subword → word (+ confidence) ---
+    # Group subword-token indices by the word they belong to.
+    tok_groups = defaultdict(list)
     for tok_idx, w_id in enumerate(word_ids):
         if w_id is not None:
-            votes[w_id].append(predictions[tok_idx])
-    word_preds = {
-        w_id: Counter(v).most_common(1)[0][0]
-        for w_id, v in votes.items()
-    }
+            tok_groups[w_id].append(tok_idx)
+
+    word_preds, word_confs = {}, {}
+    for w_id, tok_idxs in tok_groups.items():
+        win = Counter(predictions[t] for t in tok_idxs).most_common(1)[0][0]
+        word_preds[w_id] = win
+        # Confidence = mean probability assigned to the winning label across
+        # this word's subword tokens.
+        word_confs[w_id] = float(np.mean([probs[t, win] for t in tok_idxs]))
 
     word_list = [
-        {"text": w, "box": b, "label": id2label[word_preds.get(i, 0)]}
+        {
+            "text": w,
+            "box": b,
+            "label": id2label[word_preds.get(i, 0)],
+            "conf": round(word_confs.get(i, 0.0), 4),
+        }
         for i, (w, b) in enumerate(zip(words, boxes))
     ]
 
@@ -198,15 +211,27 @@ def predict(image: Image.Image) -> dict:
 
     line_items, summary = [], {}
     for row in rows:
-        row_fields = defaultdict(list)
+        texts, confs = defaultdict(list), defaultdict(list)
         for i in sorted(row, key=lambda j: boxes[j][0]):  # left-to-right within row
-            row_fields[word_list[i]["label"]].append(word_list[i]["text"])
-        row_fields = {k: " ".join(v) for k, v in row_fields.items()}
+            lbl = word_list[i]["label"]
+            texts[lbl].append(word_list[i]["text"])
+            confs[lbl].append(word_list[i]["conf"])
+        # Each field carries its joined text and the mean confidence of its words.
+        row_fields = {
+            k: {"text": " ".join(texts[k]), "conf": float(np.mean(confs[k]))}
+            for k in texts
+        }
         if any(k.startswith("menu") for k in row_fields):
             line_items.append(row_fields)
         else:
-            for k, v in row_fields.items():
-                summary[k] = (summary[k] + " " + v).strip() if k in summary else v
+            for k, cell in row_fields.items():
+                if k in summary:
+                    summary[k] = {
+                        "text": (summary[k]["text"] + " " + cell["text"]).strip(),
+                        "conf": (summary[k]["conf"] + cell["conf"]) / 2,
+                    }
+                else:
+                    summary[k] = cell
 
     return {
         "fields": fields,
