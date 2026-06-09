@@ -1,14 +1,21 @@
 # Receipt Field Extraction — PFE V2
 
-Automated extraction of structured fields (line items, totals, taxes, etc.) from receipt/invoice images using a fine-tuned LayoutLMv3 model.
+Structured field extraction (line items, totals, taxes, etc.) from receipt images using a fine-tuned **Donut** vision-language model trained on **CORD v2**.
+
+## Branch status (`donut-approach`)
+
+This branch replaces the previous LayoutLMv3 + PaddleOCR pipeline with a single end-to-end Donut model — no separate OCR engine, no token-classification post-processing.
+
+| Component | State |
+|-----------|-------|
+| Training notebook (`donut_cord_finetune.ipynb`) | Ready — Lightning AI compatible, full evaluation suite |
+| Frontend (`frontend/`) | Unchanged — Vite + React 19 + TanStack Router + shadcn/ui |
+| Express API (`backend/src/`) | Unchanged — needs a response-shape tweak once the Donut sidecar lands |
+| Inference sidecar (`backend/inference_sidecar/`) | **Empty** — old sidecar removed, Donut sidecar TBD |
 
 ## Overview
 
-The system has three components:
-
-1. **ML notebook** — `invoice_extraction_v3.ipynb` — fine-tunes Microsoft's [LayoutLMv3](https://huggingface.co/microsoft/layoutlmv3-base) on the [CORD v2](https://huggingface.co/datasets/naver-clova-ix/cord-v2) dataset. Trained weights live in `model/cord_layoutlmv3(v1)/`.
-2. **Inference sidecar** — `backend/inference_sidecar/` — a FastAPI app that loads LayoutLMv3 + EasyOCR and exposes `POST /infer`.
-3. **Express API** — `backend/src/` — handles uploads, CORS, validation, and proxies requests to the sidecar.
+Where the old approach was OCR → LayoutLMv3 token classification → normalised JSON, Donut does it all in one model:
 
 ```
 Browser / client
@@ -17,125 +24,129 @@ Browser / client
  Express :8000  (Node.js)
       │  POST /infer  (forwarded)
       ▼
- Sidecar :8001  (Python / FastAPI)
-      ├─ EasyOCR
-      ├─ LayoutLMv3Processor
-      └─ LayoutLMv3ForTokenClassification
+ Sidecar :8001  (Python / FastAPI)  ← to be rewritten for Donut
+      └─ Donut (Swin encoder + BART decoder)
+              ↳ emits CORD-schema JSON directly
 ```
 
-## Project Structure
+## Project structure
 
 ```
 .
 ├── backend/
 │   ├── src/
-│   │   ├── index.js              Entry point — CORS, health, static files, error handler
+│   │   ├── index.js              CORS, health, static files
 │   │   ├── config.js             Env-driven settings
-│   │   ├── routes/extract.js     POST /api/extract — multer upload → sidecar → JSON
-│   │   └── services/inference.js HTTP proxy to sidecar; polls /health on startup
-│   ├── inference_sidecar/
-│   │   ├── main.py               FastAPI app — GET /health, POST /infer
-│   │   ├── model_loader.py       Loads LayoutLMv3 + EasyOCR; singleton bundle
-│   │   ├── inference.py          predict() — OCR → LayoutLMv3 → grouped JSON
-│   │   ├── normalize.py          Maps CORD labels → clean receipt dict
-│   │   ├── visualize.py          Draws label boxes, saves annotated PNG
-│   │   ├── ARCHITECTURE.md       Detailed per-file walkthrough
-│   │   └── requirements.txt
-│   ├── storage/annotated/        Annotated images served at /files/annotated/*
+│   │   ├── routes/extract.js     POST /api/extract — multer upload → sidecar
+│   │   └── services/inference.js HTTP proxy to sidecar
+│   ├── inference_sidecar/        empty — Donut sidecar pending
+│   ├── storage/annotated/        legacy annotated-image directory
 │   ├── package.json
 │   └── .env.example
-├── model/
-│   └── cord_layoutlmv3(v1)/      Fine-tuned weights + processor config
-├── test_images/                  Sample receipt images for testing
-└── invoice_extraction_v3.ipynb   Training notebook
+├── frontend/                     Vite + React + TanStack
+├── test_images/                  sample receipts
+└── donut_cord_finetune.ipynb     training notebook
 ```
 
-## Requirements
+## Training the Donut model
 
-- **Node.js** 18+
-- **Python** 3.10–3.12 (tested on 3.10)
-- A CUDA-capable GPU is optional but speeds up inference significantly
+Open `donut_cord_finetune.ipynb` on **Lightning AI Studio** (single GPU, ≥24 GB VRAM). The notebook is self-contained: the first cell pins all Python deps.
 
-## Setup & Running
+Recommended GPUs (Lightning AI):
+- **A100** — ~50 min for 6 epochs (best speed/cost)
+- **L4** — ~2 h 30 m for 6 epochs (cheapest viable)
+- L40S / H100 — faster, but diminishing returns at this dataset size
 
-Two processes must run simultaneously.
+Default training config (`Cfg` class):
 
-### Terminal 1 — Inference sidecar
+| Setting | Value |
+|---------|-------|
+| Base model | `naver-clova-ix/donut-base` |
+| Dataset | `naver-clova-ix/cord-v2` (800 train / 100 val / 100 test) |
+| Epochs | 6 |
+| Image size | 1280 × 960 (downsized from Donut's default 2560 × 1920) |
+| Effective batch | 4 (`PER_DEVICE_BATCH=1`, `GRAD_ACC=4`) |
+| Learning rate | 3e-5, warmup 10 %, weight decay 0.01 |
+| Precision | bf16 on Ampere+, fp16 fallback |
+| Augmentation | ±15 % brightness/contrast, ±3° rotation |
 
-```bash
-cd backend/inference_sidecar
+Outputs after a run:
+- `donut-cord-finetuned/final/` — fine-tuned weights + processor
+- `loss_curve.png`, `f1_distribution.png` — report figures
+- `report_data.json` — full config + Trainer log history + all val/test metrics + every (gt, prediction, latency) triple
 
-# First time only — create venv and install deps (~5 min)
-py -3.10 -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
+Metrics computed (sections 9–16 of the notebook):
+- Exact-match accuracy
+- Field-level micro / macro F1 (multiset comparison — list order ignored, the way Donut's CORD evaluation does it)
+- **Normalized Tree Edit Distance (nTED)** — Donut's canonical metric
+- Latency p50 / p95 / mean
+- Per-top-level-field breakdown (`menu`, `sub_total`, `total`, …)
+- Test-split evaluation (separate from validation)
+- 10 worst predictions for qualitative error analysis
+- Final scorecard comparing validation vs test
 
-# Start
-.venv\Scripts\uvicorn main:app --port 8001
-```
+## Local development
 
-The sidecar loads the model and EasyOCR on startup (~15–30 s after a cold start). On first run, EasyOCR downloads its language models — this is covered by Express's 5-minute startup poll window.
+Until the Donut sidecar exists, only the frontend and Express run locally.
 
-### Terminal 2 — Express API
-
+### Terminal 1 — Express API
 ```bash
 cd backend
-cp .env.example .env   # adjust if needed
+cp .env.example .env
 npm install
-npm run dev            # or: npm start
+npm run dev
 ```
 
-Express listens on `http://localhost:8000` and polls `http://localhost:8001/health` every 2 s until the sidecar is ready (up to 5 minutes).
+### Terminal 2 — Frontend
+```bash
+cd frontend
+npm install
+npm run dev   # defaults to 8080; falls back to 8081 if taken
+```
+
+Express listens on `http://localhost:8000` and polls `http://localhost:8001/health` on startup — this currently times out (no sidecar yet). The frontend port (8080 or its fallback) must be in `CORS_ORIGINS` in `backend/.env`.
+
+### Terminal 3 — Inference sidecar (TBD)
+The sidecar will be rebuilt as a thin FastAPI app that loads the fine-tuned Donut model. Stub:
+
+```python
+# backend/inference_sidecar/main.py  (planned)
+processor = DonutProcessor.from_pretrained(MODEL_DIR, use_fast=False)
+model = VisionEncoderDecoderModel.from_pretrained(MODEL_DIR)
+
+# POST /infer accepts an image, runs model.generate, returns processor.token2json(sequence)
+```
 
 ## API
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | Returns `{ status, version, model_loaded }` |
-| `POST` | `/api/extract` | `multipart/form-data`, field `file`. Add `?annotate=false` to skip annotation. |
-| `GET` | `/files/annotated/:filename` | Serves a saved annotated image. |
+| `GET` | `/health` | Health check (Express; reports sidecar state) |
+| `POST` | `/api/extract` | `multipart/form-data`, field `file` |
 
 **Accepted types:** `image/jpeg`, `image/png`, `image/webp` — max 10 MB.
 
-### Example request
-
 ```bash
-curl -X POST http://localhost:8000/api/extract \
-  -F "file=@receipt.jpg"
+curl -X POST http://localhost:8000/api/extract -F "file=@receipt.jpg"
 ```
 
-### Response shape
+### Response shape (planned, CORD schema)
 
 ```jsonc
 {
   "filename": "receipt.jpg",
   "receipt": {
-    "line_items": [
-      {
-        "name": "Caffe Latte",
-        "item_num": "1",       // optional
-        "quantity": 2.0,       // optional
-        "unit_price": 4500.0,  // optional
-        "price": 9000.0,
-        "discount": 500.0      // optional
-      }
+    "menu": [
+      { "nm": "Caffe Latte", "cnt": "2", "unitprice": "4,500", "price": "9,000" }
     ],
-    "subtotal": 9000.0,
-    "discount": 500.0,
-    "service_charge": 900.0,
-    "tax": 900.0,
-    "total": 10300.0,
-    "cash_paid": 20000.0,
-    "change": 9700.0,
-    "credit_card": null,
-    "e_money": null
+    "sub_total": { "subtotal_price": "9,000", "tax_price": "900" },
+    "total":     { "total_price": "10,300", "cashprice": "20,000", "changeprice": "9,700" }
   },
-  "num_words": 14,
-  "processing_ms": 5910.2,
-  "annotated_image_url": "/files/annotated/receipt_6fa3e7fa93.png"
+  "processing_ms": 850
 }
 ```
 
-All monetary values are `float`. Fields absent from the receipt are omitted (not `null`). The annotated image URL is `null` when `?annotate=false`.
+> Donut emits the raw CORD schema (string values, comma thousands separators). The old pipeline used `normalize.py` to flatten this into camelCase keys with floats — that translation will be re-added later, either on the Express side or in a small normaliser on the sidecar.
 
 ## Configuration
 
@@ -144,58 +155,24 @@ All monetary values are `float`. Fields absent from the receipt are omitted (not
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `PORT` | `8000` | Express listen port |
-| `CORS_ORIGINS` | `localhost:3000,5173` | Comma-separated allowed origins |
+| `CORS_ORIGINS` | `localhost:3000,5173` | Allowed origins — add 8080/8081 for Vite |
 | `MAX_UPLOAD_MB` | `10` | Upload size limit |
 | `INFERENCE_SIDECAR_URL` | `http://localhost:8001` | Sidecar base URL |
-| `OUTPUT_DIR` | `backend/storage/annotated` | Directory for annotated images |
+| `OUTPUT_DIR` | `backend/storage/annotated` | Legacy annotated-image directory |
 
-### Sidecar (`backend/inference_sidecar/.env`)
+## Requirements
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `MODEL_DIR` | `../../model/cord_layoutlmv3(v1)` | Path to fine-tuned model |
-| `OUTPUT_DIR` | `../storage/annotated` | Must match Express `OUTPUT_DIR` |
-| `FORCE_CPU` | `false` | Disable CUDA even if available |
-| `OCR_LANG` | `en` | Comma-separated EasyOCR language codes |
-| `OCR_MIN_CONFIDENCE` | `0.5` | Drop OCR words below this score |
-| `OCR_UPSCALE_TO` | `1600` | Upscale short images before OCR (px, 0 = off) |
+- **Node.js** 18+
+- **Python** 3.10–3.12 (only needed for training / the future sidecar)
+- A CUDA-capable GPU for training (Lightning AI handles this); CPU is sufficient for inference at the cost of latency
 
-## Inference Pipeline
-
-```
-image
-  → EasyOCR (phrase-level regions)
-  → _split_phrase() (per-word boxes, proportional split)
-  → normalize boxes to [0, 1000]
-  → LayoutLMv3Processor (apply_ocr=False)
-  → LayoutLMv3ForTokenClassification
-  → majority-vote subword → word label aggregation
-  → spatial row clustering
-  → normalize() — CORD labels → clean keys, number strings → float
-  → (optional) annotate() → save PNG
-```
-
-**Label set:** 30 CORD classes (`menu.*`, `sub_total.*`, `total.*`, `void_menu.*`, `O`).
-
-See [`backend/inference_sidecar/ARCHITECTURE.md`](backend/inference_sidecar/ARCHITECTURE.md) for a detailed per-file walkthrough with code snippets.
-
-## Training
-
-Open `invoice_extraction_v3.ipynb` in Jupyter and run all cells. The notebook:
-
-- Loads the CORD v2 dataset via HuggingFace Datasets
-- Fine-tunes `microsoft/layoutlmv3-base` for token classification
-- Saves the trained model + processor to `model/cord_layoutlmv3(v1)/`
-
-Key training settings: `per_device_train_batch_size=1`, `gradient_accumulation_steps=4` (effective batch 4).
-
-## Tech Stack
+## Tech stack
 
 | Layer | Technology |
 |-------|-----------|
-| API server | Node.js, Express, Multer |
-| Inference server | Python, FastAPI, Uvicorn |
-| OCR | EasyOCR |
-| Document understanding | Microsoft LayoutLMv3 (HuggingFace Transformers) |
-| Training dataset | CORD v2 (Clova AI) |
-| Deep learning | PyTorch |
+| Frontend | Vite + React 19 + TanStack Router + shadcn/ui |
+| API server | Node.js + Express + Multer |
+| Inference server | Python + FastAPI + Uvicorn (to be rebuilt for Donut) |
+| Model | Donut (VisionEncoderDecoderModel — Swin encoder + BART decoder) |
+| Training dataset | CORD v2 (Naver-Clova) |
+| Deep learning | PyTorch, HuggingFace Transformers |
