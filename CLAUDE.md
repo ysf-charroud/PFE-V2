@@ -8,7 +8,7 @@ An invoice/receipt field extraction project with three components:
 
 1. **ML notebook** — `invoice_extraction_v3.ipynb` fine-tunes Microsoft's **LayoutLMv3** on the **CORD v2** dataset. The trained model + processor live in `model/cord_layoutlmv3(v1)/`.
 2. **Express API** (`backend/src/`) — handles uploads, CORS, validation, and proxies inference requests to the sidecar.
-3. **Inference sidecar** (`backend/inference_sidecar/`) — minimal FastAPI app that loads LayoutLMv3 + EasyOCR and exposes `POST /infer`.
+3. **Inference sidecar** (`backend/inference_sidecar/`) — minimal FastAPI app that loads LayoutLMv3 + PaddleOCR (PP-OCRv4) and exposes `POST /infer`.
 
 ## Project structure
 
@@ -24,8 +24,8 @@ An invoice/receipt field extraction project with three components:
 │   │       └── inference.js      HTTP proxy to sidecar; polls /health on startup (5 min timeout)
 │   ├── inference_sidecar/
 │   │   ├── main.py               FastAPI app — GET /health, POST /infer
-│   │   ├── model_loader.py       Loads LayoutLMv3 + EasyOCR; exposes bundle singleton
-│   │   ├── inference.py          predict() — OCR → LayoutLMv3 → grouped JSON
+│   │   ├── model_loader.py       Loads LayoutLMv3 + PaddleOCR (PP-OCRv4); exposes bundle singleton
+│   │   ├── inference.py          predict() — deskew → OCR → atomize → LayoutLMv3 → grouped JSON
 │   │   ├── normalize.py          normalize() — maps CORD labels → clean DB-ready receipt dict
 │   │   ├── visualize.py          annotate() — draws label boxes, saves PNG to disk
 │   │   ├── ARCHITECTURE.md       Detailed per-file explanation with code snippets
@@ -41,13 +41,13 @@ An invoice/receipt field extraction project with three components:
 
 ## Running
 
-Two processes must be running at the same time. **Use Python 3.10+** — tested on 3.10; EasyOCR supports 3.10–3.12.
+Three processes when including the frontend. **Use Python 3.10+** — tested on 3.10; PaddleOCR supports 3.10–3.12.
 
 **Terminal 1 — inference sidecar:**
 ```bash
 cd backend/inference_sidecar
 
-# First time only — create venv and install deps (~5 min, downloads PaddleOCR models on first start)
+# First time only — create venv and install deps (~5 min, downloads PP-OCRv4 det/rec/cls models on first start)
 py -3.10 -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 
@@ -63,7 +63,16 @@ npm install
 npm run dev            # nodemon, or: npm start
 ```
 
-Express listens on `http://localhost:8000`. On startup it polls `http://localhost:8001/health` every 2 s for up to **5 minutes**, logging when the sidecar is ready. The 5-minute window covers the one-time EasyOCR model download on first run; subsequent starts are fast (~15 s).
+**Terminal 3 — frontend (Vite + React):**
+```bash
+cd frontend
+npm install
+npm run dev            # defaults to port 8080; falls back to 8081 if taken
+```
+
+Express listens on `http://localhost:8000`. On startup it polls `http://localhost:8001/health` every 2 s for up to **5 minutes**, logging when the sidecar is ready. The 5-minute window covers the one-time PP-OCRv4 model download on first run; subsequent starts are fast (~15 s).
+
+Add the frontend's port to `CORS_ORIGINS` in `backend/.env` — Vite uses 8080 by default but falls back to 8081 (and beyond) if the port is taken.
 
 ## API
 
@@ -115,7 +124,7 @@ The frontend displays the annotated image by fetching `http://localhost:8000/fil
 | Env var | Default | Purpose |
 |---------|---------|---------|
 | `PORT` | `8000` | Express listen port |
-| `CORS_ORIGINS` | `localhost:3000,5173` | Comma-separated allowed origins |
+| `CORS_ORIGINS` | `localhost:3000,5173` | Comma-separated allowed origins (add 8080/8081 for the Vite frontend) |
 | `MAX_UPLOAD_MB` | `10` | Upload size limit |
 | `INFERENCE_SIDECAR_URL` | `http://localhost:8001` | Sidecar base URL |
 | `OUTPUT_DIR` | `backend/storage/annotated` | Where annotated images are saved and served from |
@@ -127,14 +136,17 @@ The frontend displays the annotated image by fetching `http://localhost:8000/fil
 | `MODEL_DIR` | `../../model/cord_layoutlmv3(v1)` | Path to fine-tuned model |
 | `OUTPUT_DIR` | `../storage/annotated` | Must match `OUTPUT_DIR` in Express config |
 | `FORCE_CPU` | `false` | Disable CUDA even if available |
-| `OCR_LANG` | `en` | Comma-separated EasyOCR language codes (e.g. `en,fr`) |
+| `OCR_LANG` | `en` | PaddleOCR language code (e.g. `en`, `fr`, `german`, `ch`) — single value, not a list |
 | `OCR_MIN_CONFIDENCE` | `0.5` | Drop OCR results below this score |
-| `OCR_UPSCALE_TO` | `1600` | Upscale short images before OCR (px, 0 = off) |
+| `OCR_UPSCALE_TO` | `2000` | Upscale long-side to this many px before OCR (0 = off). Receipts <2000 px hurt PaddleOCR detection. |
 
 ## Inference pipeline (sidecar)
 
 ```
-image → EasyOCR (phrase regions) → _split_phrase() (per-word boxes)
+image → _deskew() (Hough-line rotation if > 0.5°)
+      → _upscale_if_needed() (Lanczos to OCR_UPSCALE_TO if smaller)
+      → PaddleOCR PP-OCRv4 (phrase regions w/ angle classification)
+      → _split_phrase() → _atomize() (per-word + digit-group splits)
       → normalize boxes to [0,1000]
       → LayoutLMv3Processor (apply_ocr=False) → LayoutLMv3ForTokenClassification
       → majority vote subword → word mapping
@@ -143,6 +155,11 @@ image → EasyOCR (phrase regions) → _split_phrase() (per-word boxes)
       → (optional) annotate() → save PNG → return filename
 ```
 
+PaddleOCR is configured for accuracy over speed (`model_loader.py`):
+- `ocr_version="PP-OCRv4"`, `det_limit_side_len=2400`, `det_db_unclip_ratio=2.0`,
+  `det_db_box_thresh=0.4`, `det_db_score_mode="slow"`, `use_dilation=True`,
+  `drop_score=0.3`, `use_angle_cls=True`, `use_space_char=True`.
+
 **Label set:** 30 CORD classes (`menu.*`, `sub_total.*`, `total.*`, `void_menu.*`, `O`).
 
 See `backend/inference_sidecar/ARCHITECTURE.md` for a full per-file walkthrough with code snippets.
@@ -150,13 +167,17 @@ See `backend/inference_sidecar/ARCHITECTURE.md` for a full per-file walkthrough 
 ## Non-obvious constraints
 
 ### Sidecar
-- EasyOCR returns **phrase-level** boxes; `_split_phrase()` in `inference.py` splits them into per-word boxes proportionally by character count — required because the model was trained on CORD's per-word boxes.
+- **Torch must be imported before PaddleOCR** in `model_loader.py`. PaddleOCR's `albumentations` dependency loads torch in a way that crashes (`shm.dll` error on Windows) if Paddle's DLLs init first.
+- PaddleOCR returns **phrase-level** boxes; `_split_phrase()` in `inference.py` splits them into per-word boxes proportionally by character count — required because the model was trained on CORD's per-word boxes.
+- `_atomize()` does an additional layer of splits to fix PaddleOCR's column-mashing: letter↔digit transitions (`"RE216000"` → `"RE"`, `"216000"`), two-concatenated-amount patterns (`"110,00070,000"` → `"110,000"`, `"70,000"`), and long pure-digit runs ≥10 chars (`"111000222000"` → `"111000"`, `"222000"`).
+- **Deskew** is applied before OCR using Hough-line angle detection — no-op if estimated angle < 0.5° or < 3 supporting lines. Applied to the same image fed to LayoutLMv3 so OCR coordinates and visual features share one frame.
 - **Majority vote** is used for subword-to-word label aggregation (not first-subword-wins) — more robust for long words split into many BPE tokens.
-- **Spatial row clustering** groups labeled words by y-centre proximity into rows; rows with any `menu.*` label become line items, everything else goes into summary.
+- **Spatial row clustering** groups labeled words by y-centre proximity into rows (threshold `max(5, h*0.5)` — tightened from `max(8, h*0.6)` to stop tight-spaced receipts merging rows); rows with any `menu.*` label become line items, everything else goes into summary.
 - Boxes must be clamped to `[0,1000]` and monotonic (`x2>=x1`, `y2>=y1`) — the processor errors otherwise.
 - `enc.word_ids(0)` must be captured **before** moving tensors to the device.
-- When OCR upscaling is on, box coordinates are scaled back to original image dimensions before normalising.
+- OCR boxes are normalised against the **upscaled-deskewed** dimensions (not the original) — the same transformed image is fed to both OCR and LayoutLMv3.
 - `OUTPUT_DIR` must resolve to the same filesystem path in both the sidecar and Express.
+- If `pytesseract`/Tesseract experiments are reintroduced, set `pytesseract.pytesseract.tesseract_cmd` explicitly — the binary is rarely on PATH on Windows.
 
 ### Notebook
 - **Do not call `processed.set_format("torch")`** — triggers a buggy `torchvision.io.VideoReader` import. Use the manual `TensorWrapper` instead.
