@@ -169,30 +169,57 @@ def _normalise_summary(raw: Any, mapping: dict[str, str]) -> dict[str, float]:
 
 
 # --------------------------------------------------------------------------- #
+# Confidence mapping.
+# --------------------------------------------------------------------------- #
+
+def _map_conf(raw_conf: Any, mapping: dict[str, str]) -> dict[str, float]:
+    """Map a {raw_leaf_key: prob} dict to {clean_key: prob} via ``mapping``."""
+    out: dict[str, float] = {}
+    if not isinstance(raw_conf, dict):
+        return out
+    for src_key, prob in raw_conf.items():
+        dst_key = mapping.get(src_key)
+        if dst_key is not None and isinstance(prob, (int, float)):
+            out[dst_key] = round(float(prob), 3)
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Public entry point.
 # --------------------------------------------------------------------------- #
 
-def normalize(cord: Any) -> dict[str, Any]:
+def normalize(cord: Any, conf: Any = None) -> dict[str, Any]:
     """Top-level converter — call this with whatever ``predict()`` returned.
+
+    ``conf`` is the optional ``{"groups": {...}, "overall": float}`` structure
+    from ``predict()``; when present, per-field model confidence is attached
+    (``line_items[i].confidence``, ``field_confidence``, ``overall_confidence``).
 
     Always returns a ``dict``. Empty ``{}`` is a valid output (nothing parsed).
     """
     if not isinstance(cord, dict):
         return {}
 
+    groups = conf.get("groups", {}) if isinstance(conf, dict) else {}
+    menu_conf = groups.get("menu", []) if isinstance(groups, dict) else []
+
     # Line items: ``menu`` may be a list, a single dict (when one item),
-    # missing, or null. Donut sometimes emits one of each.
+    # missing, or null. Donut sometimes emits one of each. We index the
+    # confidence list by the *raw* menu index so dropped (empty) entries
+    # don't shift the alignment.
     menu = cord.get("menu")
+    raw_items = menu if isinstance(menu, list) else ([menu] if isinstance(menu, dict) else [])
+
     items: list[dict[str, Any]] = []
-    if isinstance(menu, list):
-        for raw in menu:
-            cleaned = _normalise_line_item(raw)
-            if cleaned:
-                items.append(cleaned)
-    elif isinstance(menu, dict):
-        cleaned = _normalise_line_item(menu)
-        if cleaned:
-            items.append(cleaned)
+    for idx, raw in enumerate(raw_items):
+        cleaned = _normalise_line_item(raw)
+        if not cleaned:
+            continue
+        if idx < len(menu_conf):
+            cmap = _map_conf(menu_conf[idx], _LINE_ITEM_KEYS)
+            if cmap:
+                cleaned["confidence"] = cmap
+        items.append(cleaned)
 
     receipt: dict[str, Any] = {}
     if items:
@@ -205,5 +232,19 @@ def normalize(cord: Any) -> dict[str, Any]:
         receipt[k] = v
     for k, v in _normalise_summary(cord.get("total"), _TOTAL_KEYS).items():
         receipt[k] = v
+
+    # Summary field confidence (only for fields that actually made it in).
+    field_conf: dict[str, float] = {}
+    if isinstance(groups, dict):
+        for grp, mapping in (("sub_total", _SUB_TOTAL_KEYS), ("total", _TOTAL_KEYS)):
+            for block in groups.get(grp, []):
+                field_conf.update(_map_conf(block, mapping))
+    field_conf = {k: v for k, v in field_conf.items() if k in receipt}
+    if field_conf:
+        receipt["field_confidence"] = field_conf
+
+    overall = conf.get("overall") if isinstance(conf, dict) else None
+    if overall is not None:
+        receipt["overall_confidence"] = round(float(overall), 3)
 
     return receipt

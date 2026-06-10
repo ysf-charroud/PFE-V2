@@ -41,10 +41,18 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_corrections_document ON corrections(document_id);
 `);
 
+// Added after the initial schema shipped — guard for existing databases.
+try {
+  db.exec('ALTER TABLE documents ADD COLUMN image_filename TEXT');
+} catch {
+  /* column already exists */
+}
+
 /** Insert a freshly-extracted document. Returns the new row id. */
 export function insertDocument({
   filename,
   annotated_filename,
+  image_filename,
   num_words,
   processing_ms,
   overall_confidence,
@@ -52,12 +60,13 @@ export function insertDocument({
 }) {
   const stmt = db.prepare(`
     INSERT INTO documents
-      (filename, annotated_filename, num_words, processing_ms, overall_confidence, receipt_json)
-    VALUES (@filename, @annotated_filename, @num_words, @processing_ms, @overall_confidence, @receipt_json)
+      (filename, annotated_filename, image_filename, num_words, processing_ms, overall_confidence, receipt_json)
+    VALUES (@filename, @annotated_filename, @image_filename, @num_words, @processing_ms, @overall_confidence, @receipt_json)
   `);
   const info = stmt.run({
     filename,
     annotated_filename: annotated_filename ?? null,
+    image_filename: image_filename ?? null,
     num_words: num_words ?? null,
     processing_ms: processing_ms ?? null,
     overall_confidence: overall_confidence ?? null,
@@ -72,6 +81,7 @@ function rowToDocument(row) {
     id: row.id,
     filename: row.filename,
     annotated_filename: row.annotated_filename,
+    image_filename: row.image_filename,
     num_words: row.num_words,
     processing_ms: row.processing_ms,
     overall_confidence: row.overall_confidence,
@@ -176,6 +186,85 @@ export function diffReceipts(original = {}, corrected = {}) {
   }
 
   return diffs;
+}
+
+/** Reviewed documents that have both a correction and a stored image —
+ * i.e. complete (image, label) pairs ready to export as training data. */
+export function listReviewedDocuments() {
+  const rows = db
+    .prepare(
+      `SELECT * FROM documents
+        WHERE reviewed = 1 AND corrected_json IS NOT NULL AND image_filename IS NOT NULL
+        ORDER BY id`,
+    )
+    .all();
+  return rows.map(rowToDocument);
+}
+
+/** Aggregate counts for the active-learning panel. */
+export function getStats() {
+  const documents = db.prepare('SELECT COUNT(*) AS n FROM documents').get().n;
+  const reviewed = db.prepare('SELECT COUNT(*) AS n FROM documents WHERE reviewed = 1').get().n;
+  const corrections = db.prepare('SELECT COUNT(*) AS n FROM corrections').get().n;
+  const trainable = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM documents
+        WHERE reviewed = 1 AND corrected_json IS NOT NULL AND image_filename IS NOT NULL`,
+    )
+    .get().n;
+  return { documents, reviewed, corrections, trainable };
+}
+
+// Inverse of the sidecar's normalize: clean receipt → raw CORD gt_parse schema.
+const _ITEM_OUT = {
+  name: 'nm',
+  sub_name: 'sub_nm',
+  item_num: 'num',
+  quantity: 'cnt',
+  unit_price: 'unitprice',
+  price: 'price',
+  discount: 'discountprice',
+};
+const _SUBTOTAL_OUT = {
+  subtotal: 'subtotal_price',
+  discount: 'discount_price',
+  service_charge: 'service_price',
+  tax: 'tax_price',
+};
+const _TOTAL_OUT = {
+  total: 'total_price',
+  cash_paid: 'cashprice',
+  change: 'changeprice',
+  credit_card: 'creditcardprice',
+  e_money: 'emoneyprice',
+};
+
+const _str = (v) => (v == null ? null : String(v));
+
+function _mapOut(obj, mapping) {
+  const out = {};
+  for (const [clean, cord] of Object.entries(mapping)) {
+    const v = obj?.[clean];
+    if (v != null && v !== '') out[cord] = _str(v);
+  }
+  return out;
+}
+
+/** Convert a clean receipt back to Donut's CORD `gt_parse` dict. */
+export function receiptToCordGtParse(receipt = {}) {
+  const gt = {};
+  const menu = (receipt.line_items ?? [])
+    .map((it) => _mapOut(it, _ITEM_OUT))
+    .filter((m) => Object.keys(m).length > 0);
+  if (menu.length) gt.menu = menu;
+
+  const sub = _mapOut(receipt, _SUBTOTAL_OUT);
+  if (Object.keys(sub).length) gt.sub_total = sub;
+
+  const total = _mapOut(receipt, _TOTAL_OUT);
+  if (Object.keys(total).length) gt.total = total;
+
+  return gt;
 }
 
 export default db;

@@ -141,6 +141,9 @@ def _build_metrics_from_report(report: dict) -> dict:
             "micro":    {"precision": micro_p, "recall": micro_r, "f1": micro_f1},
             "weighted": {"precision": weighted_p, "recall": weighted_r, "f1": weighted_f},
         },
+        # Normalized Tree-Edit-Distance — the Donut paper's structure-aware metric.
+        "ted_accuracy": test.get("TED_accuracy"),
+        "mean_normalized_ted": test.get("mean_normalized_TED"),
         "per_label": per_label,
     }
 
@@ -187,12 +190,12 @@ async def infer(
 
     t0 = time.perf_counter()
     try:
-        raw = predict(image)
+        raw, conf = predict(image)
     except Exception as exc:  # noqa: BLE001 — surface any failure as 500
         raise HTTPException(500, f"Inference failed: {exc}")
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
-    receipt = normalize(raw)
+    receipt = normalize(raw, conf)
 
     return {
         "receipt": receipt,

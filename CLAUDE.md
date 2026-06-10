@@ -10,18 +10,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 |-------|-------|
 | Training notebook `donut_cord_finetune.ipynb` | Ready — 16-section pipeline, Lightning AI compatible |
 | Old LayoutLMv3 + PaddleOCR sidecar | **Deleted on this branch** |
-| New Donut sidecar | **Not yet implemented** — `backend/inference_sidecar/` only has `.gitignore` + `.venv/` left |
-| Frontend (`frontend/`) | Unchanged |
-| Express API (`backend/src/`) | Unchanged — response shape will need a small tweak once Donut sidecar lands |
+| New Donut sidecar | **Implemented** — `main.py`, `model_loader.py`, `inference.py`, `normalize.py` (+ `test_normalize.py`). Loads fine-tuned Donut, exposes `POST /infer`, `GET /health`, `GET /metrics` |
+| Frontend (`frontend/`) | Upload → extract, editable fields, SQLite-backed Saved Documents, and a Donut evaluation dashboard on `/models` |
+| Express API (`backend/src/`) | Proxies to sidecar; persists extractions + corrections in SQLite (`db.js`, `routes/documents.js`); `/api/metrics` proxy |
 
 ## What this is
 
 A receipt field extraction project with these components:
 
 1. **Training notebook** — `donut_cord_finetune.ipynb` fine-tunes `naver-clova-ix/donut-base` on CORD v2. Output: weights + processor in `./donut-cord-finetuned/final/`.
-2. **Express API** (`backend/src/`) — handles uploads, CORS, validation, and proxies to the sidecar on port 8001.
-3. **Inference sidecar** (`backend/inference_sidecar/`) — placeholder. Future: FastAPI app that loads fine-tuned Donut and exposes `POST /infer`.
-4. **Frontend** (`frontend/`) — Vite + React + TanStack Router; uploads to `/api/extract`.
+2. **Express API** (`backend/src/`) — handles uploads, CORS, validation, proxies to the sidecar on port 8001, and persists extractions + user corrections in SQLite (`backend/storage/app.db`).
+3. **Inference sidecar** (`backend/inference_sidecar/`) — FastAPI app that loads the fine-tuned Donut model and exposes `POST /infer`, `GET /health`, `GET /metrics`.
+4. **Frontend** (`frontend/`) — Vite + React + TanStack Router; uploads to `/api/extract`, lets the user correct fields, and shows the evaluation dashboard on `/models`.
 
 ## Project structure
 
@@ -31,10 +31,12 @@ A receipt field extraction project with these components:
 │   ├── src/
 │   │   ├── index.js              CORS, health, static files, error handler
 │   │   ├── config.js             Env-driven settings
-│   │   ├── routes/extract.js     POST /api/extract — multer upload → sidecar
+│   │   ├── routes/extract.js     POST /api/extract — multer upload → sidecar → persist
+│   │   ├── routes/documents.js   GET/PATCH /api/documents — saved docs + corrections; /api/metrics
+│   │   ├── db.js                 SQLite (better-sqlite3): documents + corrections tables
 │   │   └── services/inference.js HTTP proxy to sidecar; polls /health on startup
-│   ├── inference_sidecar/        empty — Donut sidecar TBD
-│   ├── storage/annotated/        legacy annotated-image directory (unused under Donut)
+│   ├── inference_sidecar/        Donut sidecar — main.py, model_loader.py, inference.py, normalize.py
+│   ├── storage/                  app.db (SQLite) + annotated/ (legacy, unused under Donut)
 │   ├── package.json
 │   └── .env.example
 ├── frontend/                     Vite + React + TanStack
@@ -44,9 +46,18 @@ A receipt field extraction project with these components:
 
 ## Running
 
-Until the Donut sidecar is rebuilt, only the frontend and Express run locally. Training happens on Lightning AI (the notebook installs its own deps).
+Three pieces run locally: the Donut sidecar (port 8001), the Express API (port 8000), and the frontend (port 8080). Training happens on Lightning AI (the notebook installs its own deps).
 
-**Terminal 1 — Express API:**
+**Terminal 1 — Donut sidecar** (needs `transformers>=4.44,<4.50`, `sentencepiece`, `protobuf`):
+```bash
+cd backend/inference_sidecar
+.venv/bin/pip install -r requirements.txt   # first time
+cp .env.example .env                         # set MODEL_DIR to model/donut-cord-finetuned
+.venv/bin/python -m uvicorn main:app --port 8001
+```
+On macOS, prefix with `SSL_CERT_FILE=$(.venv/bin/python -c 'import certifi;print(certifi.where())')` if HF downloads hit cert errors, and set `FORCE_CPU=true`.
+
+**Terminal 2 — Express API:**
 ```bash
 cd backend
 cp .env.example .env
@@ -54,14 +65,14 @@ npm install
 npm run dev   # nodemon, or: npm start
 ```
 
-**Terminal 2 — frontend:**
+**Terminal 3 — frontend:**
 ```bash
 cd frontend
 npm install
 npm run dev   # defaults to port 8080; falls back to 8081 if taken
 ```
 
-Express listens on `http://localhost:8000`. It still polls `http://localhost:8001/health` on startup for up to 5 minutes — this currently times out until the new sidecar is built. Add the frontend port to `CORS_ORIGINS` in `backend/.env` — Vite uses 8080 by default but falls back to 8081 if taken.
+Express listens on `http://localhost:8000` and polls `http://localhost:8001/health` on startup for up to 5 minutes (covers the sidecar's model load). Add the frontend port to `CORS_ORIGINS` in `backend/.env` — Vite uses 8080 by default but falls back to 8081 if taken.
 
 ## Training the Donut model
 
