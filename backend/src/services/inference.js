@@ -3,7 +3,7 @@ import { config } from '../config.js';
 let modelLoaded = false;
 
 export async function loadModel() {
-  const maxAttempts = 150;   // 150 × 2 s = 5 min — covers first-run PaddleOCR model download
+  const maxAttempts = 150;   // 150 × 2 s = 5 min — covers Donut model load on cold start
   const delayMs = 2000;
 
   console.log(`Waiting for inference sidecar at ${config.sidecarUrl} ...`);
