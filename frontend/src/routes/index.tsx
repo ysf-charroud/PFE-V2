@@ -68,7 +68,12 @@ type Draft = {
   credit_card: string;
 };
 
-const s = (n?: number | string | null) => (n == null ? "" : String(n));
+const s = (n?: number | string | null) =>
+  n == null
+    ? ""
+    : typeof n === "number"
+      ? n.toLocaleString(undefined, { maximumFractionDigits: 2 })
+      : String(n);
 
 function num(v: string): number | undefined {
   const t = v.trim();
