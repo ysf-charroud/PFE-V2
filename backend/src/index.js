@@ -4,6 +4,7 @@ import cors from 'cors';
 import { config } from './config.js';
 import { loadModel, isModelLoaded } from './services/inference.js';
 import extractRouter from './routes/extract.js';
+import documentsRouter from './routes/documents.js';
 
 fs.mkdirSync(config.outputDir, { recursive: true });
 
@@ -17,6 +18,7 @@ app.get('/health', (_req, res) => {
 });
 
 app.use('/api', extractRouter);
+app.use('/api', documentsRouter);
 
 app.use(config.outputUrlPath, express.static(config.outputDir));
 

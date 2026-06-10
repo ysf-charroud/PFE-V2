@@ -2,6 +2,7 @@ import { Router } from 'express';
 import multer from 'multer';
 import { config } from '../config.js';
 import { predict } from '../services/inference.js';
+import { insertDocument } from '../db.js';
 
 const router = Router();
 
@@ -36,7 +37,18 @@ router.post('/extract', upload.single('file'), async (req, res, next) => {
       ? `${config.outputUrlPath}/${result.annotated_filename}`
       : null;
 
+    // Persist the extraction so it survives reloads and can be corrected later.
+    const id = insertDocument({
+      filename: req.file.originalname,
+      annotated_filename: result.annotated_filename ?? null,
+      num_words: result.num_words,
+      processing_ms: elapsed_ms,
+      overall_confidence: result.receipt?.overall_confidence ?? null,
+      receipt: result.receipt,
+    });
+
     return res.json({
+      id,
       filename: req.file.originalname,
       receipt: result.receipt,
       num_words: result.num_words,
