@@ -10,9 +10,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 |-------|-------|
 | Training notebook `donut_cord_finetune.ipynb` | Ready — 16-section pipeline, Lightning AI compatible |
 | Old LayoutLMv3 + PaddleOCR sidecar | **Deleted on this branch** |
-| New Donut sidecar | **Not yet implemented** — `backend/inference_sidecar/` only has `.gitignore` + `.venv/` left |
+| New Donut sidecar | **Implemented** — `backend/inference_sidecar/` has full FastAPI app (`main.py`, `model_loader.py`, `inference.py`, `normalize.py`) |
 | Frontend (`frontend/`) | Unchanged |
-| Express API (`backend/src/`) | Unchanged — response shape will need a small tweak once Donut sidecar lands |
+| Express API (`backend/src/`) | Unchanged — response shape is compatible (sidecar preserves legacy `num_words`/`annotated_filename` fields) |
 
 ## What this is
 
@@ -20,7 +20,7 @@ A receipt field extraction project with these components:
 
 1. **Training notebook** — `donut_cord_finetune.ipynb` fine-tunes `naver-clova-ix/donut-base` on CORD v2. Output: weights + processor in `./donut-cord-finetuned/final/`.
 2. **Express API** (`backend/src/`) — handles uploads, CORS, validation, and proxies to the sidecar on port 8001.
-3. **Inference sidecar** (`backend/inference_sidecar/`) — placeholder. Future: FastAPI app that loads fine-tuned Donut and exposes `POST /infer`.
+3. **Inference sidecar** (`backend/inference_sidecar/`) — FastAPI app that loads fine-tuned Donut and exposes `GET /health`, `POST /infer`, and `GET /metrics`. No OCR step — pure image → `generate()` → `token2json` → CORD normaliser.
 4. **Frontend** (`frontend/`) — Vite + React + TanStack Router; uploads to `/api/extract`.
 
 ## Project structure
@@ -33,7 +33,14 @@ A receipt field extraction project with these components:
 │   │   ├── config.js             Env-driven settings
 │   │   ├── routes/extract.js     POST /api/extract — multer upload → sidecar
 │   │   └── services/inference.js HTTP proxy to sidecar; polls /health on startup
-│   ├── inference_sidecar/        empty — Donut sidecar TBD
+│   ├── inference_sidecar/
+│   │   ├── main.py               FastAPI app — /health, /infer, /metrics
+│   │   ├── model_loader.py       ModelBundle singleton — loads DonutProcessor + VisionEncoderDecoderModel
+│   │   ├── inference.py          predict() — generate() + token2json
+│   │   ├── normalize.py          CORD-shape dict → camelCase receipt with float values
+│   │   ├── test_normalize.py     56 pure-Python assertions for the normaliser
+│   │   ├── requirements.txt      fastapi, uvicorn, torch, transformers>=4.44,<4.50, …
+│   │   └── .env.example          MODEL_DIR, FORCE_CPU, TASK_TOKEN, MAX_LENGTH, USE_SLOW_TOKENIZER
 │   ├── storage/annotated/        legacy annotated-image directory (unused under Donut)
 │   ├── package.json
 │   └── .env.example
@@ -44,9 +51,20 @@ A receipt field extraction project with these components:
 
 ## Running
 
-Until the Donut sidecar is rebuilt, only the frontend and Express run locally. Training happens on Lightning AI (the notebook installs its own deps).
+Three processes run locally. Training happens on Lightning AI (the notebook installs its own deps).
 
-**Terminal 1 — Express API:**
+**Terminal 1 — Donut inference sidecar (Python):**
+```bash
+cd backend/inference_sidecar
+cp .env.example .env          # set MODEL_DIR if weights aren't at default path
+python -m venv .venv
+.venv/Scripts/activate        # Windows; Linux/Mac: source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn main:app --port 8001
+```
+Requires fine-tuned weights at `model/donut-cord-finetuned/` (or `final/` subdir). Set `MODEL_DIR` in `.env` to override. Sidecar is ready when `/health` returns `{ "model_loaded": true }`.
+
+**Terminal 2 — Express API:**
 ```bash
 cd backend
 cp .env.example .env
@@ -54,14 +72,14 @@ npm install
 npm run dev   # nodemon, or: npm start
 ```
 
-**Terminal 2 — frontend:**
+**Terminal 3 — frontend:**
 ```bash
 cd frontend
 npm install
 npm run dev   # defaults to port 8080; falls back to 8081 if taken
 ```
 
-Express listens on `http://localhost:8000`. It still polls `http://localhost:8001/health` on startup for up to 5 minutes — this currently times out until the new sidecar is built. Add the frontend port to `CORS_ORIGINS` in `backend/.env` — Vite uses 8080 by default but falls back to 8081 if taken.
+Express listens on `http://localhost:8000` and polls `http://localhost:8001/health` every 2 s for up to 5 minutes on startup. Add the frontend port to `CORS_ORIGINS` in `backend/.env` — Vite uses 8080 by default but falls back to 8081 if taken.
 
 ## Training the Donut model
 
@@ -107,17 +125,25 @@ Notebook sections:
 | 15 | F1 distribution histogram + 10 worst predictions |
 | 16 | Final scorecard comparing validation vs test |
 
-## API (current, pre-rewrite)
+## API
 
-The Express API contract is unchanged from the old LayoutLMv3 pipeline. It will change once the Donut sidecar is wired up; below is the *current* contract.
+### Express API (`localhost:8000`)
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Returns `{ status, version, model_loaded }` |
-| POST | `/api/extract` | `multipart/form-data`, field `file`. Query `?annotate=false` to skip annotation. |
-| GET | `/files/annotated/:filename` | Serves a saved annotated image (legacy; no annotations under Donut). |
+| POST | `/api/extract` | `multipart/form-data`, field `file`. Query `?annotate=false` accepted (no-op under Donut). |
+| GET | `/files/annotated/:filename` | Legacy annotated-image route (unused under Donut). |
 
 Accepted types: `image/jpeg`, `image/png`, `image/webp`. Max 10 MB.
+
+### Sidecar API (`localhost:8001`)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | `{ status, model_loaded, device, model_dir }` — Express polls this on startup |
+| POST | `/infer` | `multipart/form-data`, field `file`. Returns `{ receipt, raw, num_words, annotated_filename, processing_ms }` |
+| GET | `/metrics` | Reshapes `report_data.json` into the frontend `Metrics` type. Returns `{ available: false }` if no report found. |
 
 ## Config (`backend/src/config.js`)
 
@@ -129,17 +155,18 @@ Accepted types: `image/jpeg`, `image/png`, `image/webp`. Max 10 MB.
 | `INFERENCE_SIDECAR_URL` | `http://localhost:8001` | Sidecar base URL |
 | `OUTPUT_DIR` | `backend/storage/annotated` | Legacy annotated-image directory |
 
-## Donut inference pipeline (what the future sidecar will do)
+## Donut inference pipeline
 
 ```
 image (PIL)
   → DonutProcessor.image_processor (resize 1280×960, normalize → pixel_values)
   → VisionEncoderDecoderModel.generate(decoder_input_ids=[<s_cord-v2>])
   → emits sequence: <s_cord-v2><s_menu><s_nm>...</s_nm>...</s_menu>...</s>
-  → processor.token2json(sequence) → nested dict matching CORD schema
+  → processor.token2json(sequence) → nested CORD-shape dict
+  → normalize(cord_dict) → { line_items, subtotal, tax, total, … }
 ```
 
-No separate OCR step. No box clamping. No row clustering. No `normalize.py`. The model takes responsibility for the full image-to-JSON mapping.
+No separate OCR step. No box clamping. No row clustering. The model takes responsibility for the full image-to-JSON mapping. `normalize.py` handles CORD key → camelCase mapping, float parsing, and both list and single-dict `menu` shapes.
 
 ## Non-obvious constraints
 
@@ -158,5 +185,12 @@ No separate OCR step. No box clamping. No row clustering. No `normalize.py`. The
 ### Branch state
 - `model/cord_layoutlmv3(v1)/` (legacy LayoutLMv3 weights) is gitignored and may still exist on disk. Safe to delete locally.
 - A leftover `donut_cord_finetune(1).ipynb` (if present) is the Lightning AI download of an earlier 5-epoch run — *not* the current local 6-epoch version with sections 13–16. Treat the unsuffixed `donut_cord_finetune.ipynb` as authoritative.
-- `backend/inference_sidecar/.venv/` still has PaddleOCR installed from the previous approach. Recreate it cleanly when building the new Donut sidecar.
-- `backend/inference_sidecar/.gitignore` was kept on purpose (still useful for the new sidecar).
+- `backend/inference_sidecar/.venv/` may still have PaddleOCR installed from the previous approach. Recreate it cleanly if packages seem wrong.
+
+### Donut sidecar
+- **`model_loader.py` raises `FileNotFoundError`** at startup if no `config.json` is found — the sidecar will not start without fine-tuned weights. Set `MODEL_DIR` in `.env` to the correct path.
+- **`menu` can be a single dict** (one-item receipt) or a list. `normalize()` handles both.
+- **`token2json` is fallible** — on malformed sequences it raises; `inference.py` catches and returns `{}`. Frontend shows an empty receipt rather than a 500.
+- **`bad_words_ids=[[unk_token_id]]`** in `generate()` prevents `<unk>` tokens that would crash `token2json`.
+- **`decoder_start_ids` pre-encoded once** at load time in `model_loader.py` — re-encoding per request adds noticeable latency on CPU.
+- **`FORCE_CPU=true`** in `.env` disables CUDA even when a GPU is available — useful for testing on a CPU-only machine.
