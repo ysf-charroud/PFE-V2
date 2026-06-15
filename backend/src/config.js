@@ -15,4 +15,5 @@ export const config = {
   sidecarUrl: process.env.INFERENCE_SIDECAR_URL ?? 'http://localhost:8001',
   outputDir: process.env.OUTPUT_DIR ?? path.join(BACKEND_DIR, 'storage', 'annotated'),
   outputUrlPath: '/files/annotated',
+  uploadDir: process.env.UPLOAD_DIR ?? path.join(BACKEND_DIR, 'storage', 'uploads'),
 };

@@ -3,8 +3,10 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import invoiceScan from "@/assets/invoice-scan.jpg";
 import {
+  correctionsExportUrl,
   extractReceipt,
   getHealth,
+  getStats,
   listDocuments,
   resolveApiUrl,
   saveCorrection,
@@ -21,7 +23,7 @@ export const Route = createFileRoute("/")({
       {
         name: "description",
         content:
-          "Process invoices and receipts with OpenCV, EasyOCR and LayoutLM. View extracted fields and commit to local SQLite.",
+          "Extract receipt fields with a fine-tuned Donut model. Review and correct the results, then commit to local SQLite.",
       },
     ],
   }),
@@ -30,6 +32,8 @@ export const Route = createFileRoute("/")({
 
 const fmt = (n?: number | null) =>
   n == null ? "—" : n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+
+const PAGE_SIZE = 8; // rows per page in the Saved Documents table
 
 /** Mean of a per-field confidence map, or null if empty. */
 function meanConfidence(conf?: Record<string, number>): number | null {
@@ -64,7 +68,12 @@ type Draft = {
   credit_card: string;
 };
 
-const s = (n?: number | string | null) => (n == null ? "" : String(n));
+const s = (n?: number | string | null) =>
+  n == null
+    ? ""
+    : typeof n === "number"
+      ? n.toLocaleString(undefined, { maximumFractionDigits: 2 })
+      : String(n);
 
 function num(v: string): number | undefined {
   const t = v.trim();
@@ -129,7 +138,7 @@ function fromDraft(d: Draft): Receipt {
 type DocView = {
   id: number;
   filename: string;
-  receipt: Receipt; // original model output (for confidence display)
+  receipt: Receipt; // original model output
   corrected: Receipt | null;
   num_words: number;
   processing_ms: number;
@@ -172,6 +181,7 @@ function DocumentsPage() {
   const [baseline, setBaseline] = useState("");
   const [dragOver, setDragOver] = useState(false);
   const [mounted, setMounted] = useState(false);
+  const [page, setPage] = useState(1);
 
   useEffect(() => setMounted(true), []);
   useEffect(() => {
@@ -206,11 +216,18 @@ function DocumentsPage() {
     enabled: mounted,
   });
 
+  const stats = useQuery({
+    queryKey: ["stats"],
+    queryFn: getStats,
+    enabled: mounted,
+  });
+
   const extract = useMutation({
     mutationFn: (file: File) => extractReceipt(file),
     onSuccess: (data) => {
       setActive(viewFromExtract(data));
       qc.invalidateQueries({ queryKey: ["documents"] });
+      qc.invalidateQueries({ queryKey: ["stats"] });
     },
   });
 
@@ -219,6 +236,7 @@ function DocumentsPage() {
     onSuccess: (doc) => {
       setActive(viewFromSaved(doc));
       qc.invalidateQueries({ queryKey: ["documents"] });
+      qc.invalidateQueries({ queryKey: ["stats"] });
     },
   });
 
@@ -240,7 +258,7 @@ function DocumentsPage() {
   const setSummary = (key: keyof Draft, value: string) =>
     setDraft((d) => (d ? { ...d, [key]: value } : d));
 
-  const base = active?.receipt;
+  const base = active?.receipt; // original model output — carries confidence
   const items = draft?.items ?? [];
   const displayImage = resolveApiUrl(active?.annotated_image_url) ?? previewUrl ?? invoiceScan;
   const dirty = draft != null && JSON.stringify(draft) !== baseline;
@@ -256,6 +274,12 @@ function DocumentsPage() {
   const totalQty = items.reduce((sum, it) => sum + (num(it.quantity) ?? 0), 0);
   const savedDocs = documents.data ?? [];
 
+  // Client-side pagination over the saved documents list.
+  const pageCount = Math.max(1, Math.ceil(savedDocs.length / PAGE_SIZE));
+  const safePage = Math.min(Math.max(1, page), pageCount);
+  const pageStart = (safePage - 1) * PAGE_SIZE;
+  const pageDocs = savedDocs.slice(pageStart, pageStart + PAGE_SIZE);
+
   return (
     <main className="max-w-7xl mx-auto px-6 py-8">
       {/* Header / Stats */}
@@ -264,15 +288,15 @@ function DocumentsPage() {
           Document Processing Pipeline
         </h1>
         <p className="text-sm text-muted-foreground mb-6">
-          Hybrid Computer Vision + NLP pipeline. OpenCV → EasyOCR → LayoutLM → SQLite.
+          OCR-free receipt understanding. Donut (image → structured fields) → SQLite.
         </p>
 
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           {[
             { label: "Saved Documents", value: String(savedDocs.length) },
             {
-              label: "Words Detected",
-              value: active ? String(active.num_words) : "—",
+              label: "Line Items",
+              value: active ? String(items.length) : "—",
               mono: true,
             },
             {
@@ -375,7 +399,7 @@ function DocumentsPage() {
                 {extract.isPending && (
                   <div className="absolute inset-0 bg-ink/40 backdrop-blur-[1px] flex items-center justify-center">
                     <span className="text-xs font-mono text-panel uppercase tracking-widest animate-pulse">
-                      Running OCR + LayoutLM…
+                      Running Donut…
                     </span>
                   </div>
                 )}
@@ -388,9 +412,9 @@ function DocumentsPage() {
             <div className="flex flex-wrap gap-4">
               {[
                 { label: "Upload", done: status !== "idle" },
-                { label: "EasyOCR Scan", done: status === "success", active: status === "pending" },
+                { label: "Donut Encode", done: status === "success", active: status === "pending" },
                 {
-                  label: "LayoutLM Analysis",
+                  label: "Decode Fields",
                   done: status === "success",
                   active: status === "pending",
                 },
@@ -429,7 +453,7 @@ function DocumentsPage() {
                     <ConfidenceBar value={base.overall_confidence} label="conf" />
                   )}
                   <span className="text-[10px] font-mono text-subtle uppercase tracking-wider whitespace-nowrap">
-                    {active.num_words} words · {(active.processing_ms / 1000).toFixed(1)}s
+                    {items.length} items · {(active.processing_ms / 1000).toFixed(1)}s
                   </span>
                 </div>
               )}
@@ -648,6 +672,53 @@ function DocumentsPage() {
         </div>
       </div>
 
+      {/* Active Learning */}
+      <section className="mt-12">
+        <div className="flex items-end justify-between mb-4 flex-wrap gap-3">
+          <div>
+            <h2 className="text-lg font-semibold text-foreground tracking-tight">
+              Active Learning
+            </h2>
+            <p className="text-sm text-muted-foreground">
+              Every correction becomes a labelled (image, fields) pair. Export them as a CORD
+              fine-tuning set to retrain Donut.
+            </p>
+          </div>
+          <a
+            href={correctionsExportUrl}
+            className={`px-4 py-2 rounded-md text-xs font-semibold ring-1 ring-brand transition-opacity ${
+              (stats.data?.trainable ?? 0) > 0
+                ? "bg-brand text-brand-foreground hover:opacity-90"
+                : "bg-secondary text-muted-foreground pointer-events-none opacity-50"
+            }`}
+          >
+            Export retraining set
+            {(stats.data?.trainable ?? 0) > 0 ? ` (${stats.data?.trainable})` : ""}
+          </a>
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          {[
+            { label: "Documents", value: stats.data?.documents },
+            { label: "Reviewed", value: stats.data?.reviewed },
+            { label: "Field Corrections", value: stats.data?.corrections },
+            { label: "Trainable Pairs", value: stats.data?.trainable, accent: true },
+          ].map((c) => (
+            <div key={c.label} className="p-4 bg-panel rounded-xl ring-1 ring-border">
+              <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-1">
+                {c.label}
+              </p>
+              <p
+                className={`text-2xl font-medium font-mono ${
+                  c.accent ? "text-brand" : "text-foreground"
+                }`}
+              >
+                {c.value ?? "—"}
+              </p>
+            </div>
+          ))}
+        </div>
+      </section>
+
       {/* Saved Documents Table */}
       <section className="mt-12">
         <div className="flex items-center justify-between mb-6">
@@ -676,7 +747,7 @@ function DocumentsPage() {
                   </td>
                 </tr>
               ) : (
-                savedDocs.map((d) => {
+                pageDocs.map((d) => {
                   const r = d.corrected_receipt ?? d.receipt;
                   return (
                     <tr
@@ -731,34 +802,37 @@ function DocumentsPage() {
               )}
             </tbody>
           </table>
+
+          {savedDocs.length > PAGE_SIZE && (
+            <div className="flex items-center justify-between gap-3 px-6 py-3 border-t border-border">
+              <span className="text-xs text-muted-foreground font-mono">
+                {pageStart + 1}–{Math.min(pageStart + PAGE_SIZE, savedDocs.length)} of{" "}
+                {savedDocs.length}
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setPage(safePage - 1)}
+                  disabled={safePage <= 1}
+                  className="px-3 py-1 rounded-md text-xs font-semibold ring-1 ring-border text-foreground hover:bg-secondary transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  Prev
+                </button>
+                <span className="text-xs text-muted-foreground font-mono">
+                  Page {safePage} / {pageCount}
+                </span>
+                <button
+                  onClick={() => setPage(safePage + 1)}
+                  disabled={safePage >= pageCount}
+                  className="px-3 py-1 rounded-md text-xs font-semibold ring-1 ring-border text-foreground hover:bg-secondary transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </section>
     </main>
-  );
-}
-
-/** Small bar visualizing a model-confidence value in [0, 1]. */
-function ConfidenceBar({
-  value,
-  label,
-  compact,
-}: {
-  value: number;
-  label?: string;
-  compact?: boolean;
-}) {
-  const pct = Math.round(value * 100);
-  const color = pct >= 90 ? "bg-success" : pct >= 70 ? "bg-warning" : "bg-destructive";
-  const text = pct >= 90 ? "text-success" : pct >= 70 ? "text-warning" : "text-destructive";
-  return (
-    <div className="flex items-center justify-end gap-1.5" title={`Model confidence: ${pct}%`}>
-      <div className={`${compact ? "w-10" : "w-14"} h-1.5 bg-surface rounded-full overflow-hidden`}>
-        <div className={`h-full ${color}`} style={{ width: `${pct}%` }} />
-      </div>
-      <span className={`text-[10px] font-mono ${text}`}>
-        {pct}%{label ? ` ${label}` : ""}
-      </span>
-    </div>
   );
 }
 
@@ -809,6 +883,31 @@ function EditTotalRow({
           className="w-28 bg-secondary ring-1 ring-border rounded-md px-2 py-1 text-right font-mono text-sm text-foreground focus:ring-brand focus:ring-2 outline-none"
         />
       </div>
+    </div>
+  );
+}
+
+/** Small bar visualizing a model-confidence value in [0, 1]. */
+function ConfidenceBar({
+  value,
+  label,
+  compact,
+}: {
+  value: number;
+  label?: string;
+  compact?: boolean;
+}) {
+  const pct = Math.round(value * 100);
+  const color = pct >= 90 ? "bg-success" : pct >= 70 ? "bg-warning" : "bg-destructive";
+  const text = pct >= 90 ? "text-success" : pct >= 70 ? "text-warning" : "text-destructive";
+  return (
+    <div className="flex items-center justify-end gap-1.5" title={`Model confidence: ${pct}%`}>
+      <div className={`${compact ? "w-10" : "w-14"} h-1.5 bg-surface rounded-full overflow-hidden`}>
+        <div className={`h-full ${color}`} style={{ width: `${pct}%` }} />
+      </div>
+      <span className={`text-[10px] font-mono ${text}`}>
+        {pct}%{label ? ` ${label}` : ""}
+      </span>
     </div>
   );
 }

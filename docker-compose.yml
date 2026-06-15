@@ -1,0 +1,50 @@
+# One-command local stack: Donut sidecar + Express API + frontend.
+#   docker compose up --build
+# Then open http://localhost:8080
+#
+# Requires the fine-tuned model at ./model/donut-cord-finetuned/ (mounted, not
+# baked into the image).
+
+services:
+  sidecar:
+    build: ./backend/inference_sidecar
+    expose:
+      - "8001"
+    volumes:
+      - ./model:/models:ro
+    environment:
+      - FORCE_CPU=true
+      - MODEL_DIR=/models/donut-cord-finetuned
+      - METRICS_PATH=/models/donut-cord-finetuned/report_data.json
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if __import__('json').load(urllib.request.urlopen('http://localhost:8001/health'))['model_loaded'] else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+
+  express:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - INFERENCE_SIDECAR_URL=http://sidecar:8001
+      - CORS_ORIGINS=http://localhost:8080
+    volumes:
+      - app-storage:/app/storage
+    depends_on:
+      sidecar:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "8080:8080"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - express
+
+volumes:
+  app-storage:

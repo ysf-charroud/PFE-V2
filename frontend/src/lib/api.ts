@@ -137,6 +137,8 @@ export type Metrics = {
     micro: AvgMetric;
     weighted: AvgMetric;
   };
+  ted_accuracy?: number | null;
+  mean_normalized_ted?: number | null;
   per_label?: LabelMetric[];
 };
 
@@ -146,6 +148,23 @@ export async function getMetrics(): Promise<Metrics> {
   if (!res.ok) throw new Error(`Failed to load metrics (HTTP ${res.status})`);
   return (await res.json()) as Metrics;
 }
+
+export type Stats = {
+  documents: number;
+  reviewed: number;
+  corrections: number;
+  trainable: number;
+};
+
+/** Active-learning counts for the dashboard panel. */
+export async function getStats(): Promise<Stats> {
+  const res = await fetch(`${API_BASE_URL}/api/stats`);
+  if (!res.ok) throw new Error(`Failed to load stats (HTTP ${res.status})`);
+  return (await res.json()) as Stats;
+}
+
+/** Download URL for the corrections training set (zip). */
+export const correctionsExportUrl = `${API_BASE_URL}/api/corrections/export`;
 
 /** List persisted documents, most recent first. */
 export async function listDocuments(): Promise<SavedDocument[]> {

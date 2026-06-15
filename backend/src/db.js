@@ -1,17 +1,18 @@
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import Database from 'better-sqlite3';
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import Database from "better-sqlite3";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const BACKEND_DIR = path.resolve(__dirname, '..');
-const DB_PATH = process.env.DB_PATH ?? path.join(BACKEND_DIR, 'storage', 'app.db');
+const BACKEND_DIR = path.resolve(__dirname, "..");
+const DB_PATH =
+  process.env.DB_PATH ?? path.join(BACKEND_DIR, "storage", "app.db");
 
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
 const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS documents (
@@ -41,10 +42,18 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_corrections_document ON corrections(document_id);
 `);
 
+// Added after the initial schema shipped — guard for existing databases.
+try {
+  db.exec("ALTER TABLE documents ADD COLUMN image_filename TEXT");
+} catch {
+  /* column already exists */
+}
+
 /** Insert a freshly-extracted document. Returns the new row id. */
 export function insertDocument({
   filename,
   annotated_filename,
+  image_filename,
   num_words,
   processing_ms,
   overall_confidence,
@@ -52,12 +61,13 @@ export function insertDocument({
 }) {
   const stmt = db.prepare(`
     INSERT INTO documents
-      (filename, annotated_filename, num_words, processing_ms, overall_confidence, receipt_json)
-    VALUES (@filename, @annotated_filename, @num_words, @processing_ms, @overall_confidence, @receipt_json)
+      (filename, annotated_filename, image_filename, num_words, processing_ms, overall_confidence, receipt_json)
+    VALUES (@filename, @annotated_filename, @image_filename, @num_words, @processing_ms, @overall_confidence, @receipt_json)
   `);
   const info = stmt.run({
     filename,
     annotated_filename: annotated_filename ?? null,
+    image_filename: image_filename ?? null,
     num_words: num_words ?? null,
     processing_ms: processing_ms ?? null,
     overall_confidence: overall_confidence ?? null,
@@ -72,11 +82,14 @@ function rowToDocument(row) {
     id: row.id,
     filename: row.filename,
     annotated_filename: row.annotated_filename,
+    image_filename: row.image_filename,
     num_words: row.num_words,
     processing_ms: row.processing_ms,
     overall_confidence: row.overall_confidence,
     receipt: JSON.parse(row.receipt_json),
-    corrected_receipt: row.corrected_json ? JSON.parse(row.corrected_json) : null,
+    corrected_receipt: row.corrected_json
+      ? JSON.parse(row.corrected_json)
+      : null,
     reviewed: !!row.reviewed,
     created_at: row.created_at,
     reviewed_at: row.reviewed_at,
@@ -84,20 +97,20 @@ function rowToDocument(row) {
 }
 
 export function getDocument(id) {
-  const row = db.prepare('SELECT * FROM documents WHERE id = ?').get(id);
+  const row = db.prepare("SELECT * FROM documents WHERE id = ?").get(id);
   return rowToDocument(row);
 }
 
 export function listDocuments(limit = 100) {
   const rows = db
-    .prepare('SELECT * FROM documents ORDER BY id DESC LIMIT ?')
+    .prepare("SELECT * FROM documents ORDER BY id DESC LIMIT ?")
     .all(limit);
   return rows.map(rowToDocument);
 }
 
 export function getCorrections(documentId) {
   return db
-    .prepare('SELECT * FROM corrections WHERE document_id = ? ORDER BY id')
+    .prepare("SELECT * FROM corrections WHERE document_id = ? ORDER BY id")
     .all(documentId);
 }
 
@@ -117,7 +130,7 @@ export const saveCorrection = db.transaction((id, correctedReceipt) => {
   ).run(JSON.stringify(correctedReceipt), id);
 
   // Replace prior corrections for this document (idempotent re-saves).
-  db.prepare('DELETE FROM corrections WHERE document_id = ?').run(id);
+  db.prepare("DELETE FROM corrections WHERE document_id = ?").run(id);
 
   const diffs = diffReceipts(existing.receipt, correctedReceipt);
   const insert = db.prepare(`
@@ -137,30 +150,42 @@ const toStr = (v) => (v == null ? null : String(v));
 export function diffReceipts(original = {}, corrected = {}) {
   const diffs = [];
   const SUMMARY_KEYS = [
-    'subtotal',
-    'discount',
-    'service_charge',
-    'other_charges',
-    'tax',
-    'total',
-    'cash_paid',
-    'change',
-    'credit_card',
-    'e_money',
+    "subtotal",
+    "discount",
+    "service_charge",
+    "other_charges",
+    "tax",
+    "total",
+    "cash_paid",
+    "change",
+    "credit_card",
+    "e_money",
   ];
 
   for (const key of SUMMARY_KEYS) {
     const a = original[key];
     const b = corrected[key];
     if (toStr(a) !== toStr(b)) {
-      diffs.push({ field_path: key, original_value: toStr(a), corrected_value: toStr(b) });
+      diffs.push({
+        field_path: key,
+        original_value: toStr(a),
+        corrected_value: toStr(b),
+      });
     }
   }
 
   const oItems = original.line_items ?? [];
   const cItems = corrected.line_items ?? [];
   const n = Math.max(oItems.length, cItems.length);
-  const ITEM_KEYS = ['name', 'sub_name', 'item_num', 'quantity', 'unit_price', 'price', 'discount'];
+  const ITEM_KEYS = [
+    "name",
+    "sub_name",
+    "item_num",
+    "quantity",
+    "unit_price",
+    "price",
+    "discount",
+  ];
   for (let i = 0; i < n; i++) {
     const a = oItems[i] ?? {};
     const b = cItems[i] ?? {};
@@ -176,6 +201,89 @@ export function diffReceipts(original = {}, corrected = {}) {
   }
 
   return diffs;
+}
+
+/** Reviewed documents that have both a correction and a stored image —
+ * i.e. complete (image, label) pairs ready to export as training data. */
+export function listReviewedDocuments() {
+  const rows = db
+    .prepare(
+      `SELECT * FROM documents
+        WHERE reviewed = 1 AND corrected_json IS NOT NULL AND image_filename IS NOT NULL
+        ORDER BY id`,
+    )
+    .all();
+  return rows.map(rowToDocument);
+}
+
+/** Aggregate counts for the active-learning panel. */
+export function getStats() {
+  const documents = db.prepare("SELECT COUNT(*) AS n FROM documents").get().n;
+  const reviewed = db
+    .prepare("SELECT COUNT(*) AS n FROM documents WHERE reviewed = 1")
+    .get().n;
+  const corrections = db
+    .prepare("SELECT COUNT(*) AS n FROM corrections")
+    .get().n;
+  const trainable = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM documents
+        WHERE reviewed = 1 AND corrected_json IS NOT NULL AND image_filename IS NOT NULL`,
+    )
+    .get().n;
+  return { documents, reviewed, corrections, trainable };
+}
+
+// Inverse of the sidecar's normalize: clean receipt → raw CORD gt_parse schema.
+const _ITEM_OUT = {
+  name: "nm",
+  sub_name: "sub_nm",
+  item_num: "num",
+  quantity: "cnt",
+  unit_price: "unitprice",
+  price: "price",
+  discount: "discountprice",
+};
+const _SUBTOTAL_OUT = {
+  subtotal: "subtotal_price",
+  discount: "discount_price",
+  service_charge: "service_price",
+  tax: "tax_price",
+};
+const _TOTAL_OUT = {
+  total: "total_price",
+  cash_paid: "cashprice",
+  change: "changeprice",
+  credit_card: "creditcardprice",
+  e_money: "emoneyprice",
+};
+
+const _str = (v) => (v == null ? null : String(v));
+
+function _mapOut(obj, mapping) {
+  const out = {};
+  for (const [clean, cord] of Object.entries(mapping)) {
+    const v = obj?.[clean];
+    if (v != null && v !== "") out[cord] = _str(v);
+  }
+  return out;
+}
+
+/** Convert a clean receipt back to Donut's CORD `gt_parse` dict. */
+export function receiptToCordGtParse(receipt = {}) {
+  const gt = {};
+  const menu = (receipt.line_items ?? [])
+    .map((it) => _mapOut(it, _ITEM_OUT))
+    .filter((m) => Object.keys(m).length > 0);
+  if (menu.length) gt.menu = menu;
+
+  const sub = _mapOut(receipt, _SUBTOTAL_OUT);
+  if (Object.keys(sub).length) gt.sub_total = sub;
+
+  const total = _mapOut(receipt, _TOTAL_OUT);
+  if (Object.keys(total).length) gt.total = total;
+
+  return gt;
 }
 
 export default db;

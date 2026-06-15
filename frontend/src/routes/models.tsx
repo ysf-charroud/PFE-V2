@@ -10,7 +10,7 @@ export const Route = createFileRoute("/models")({
       { title: "Models — Vector IDP" },
       {
         name: "description",
-        content: "Configure the OCR and document understanding models powering the IDP pipeline.",
+        content: "Donut model evaluation and the components powering the IDP pipeline.",
       },
     ],
   }),
@@ -19,31 +19,17 @@ export const Route = createFileRoute("/models")({
 
 const models = [
   {
-    name: "OpenCV",
-    role: "Pre-processing",
-    version: "4.10.0",
-    desc: "Deskew, denoise, grayscale and adaptive thresholding to maximize OCR accuracy.",
-    status: "Active",
-  },
-  {
-    name: "EasyOCR",
-    role: "Optical Character Recognition",
-    version: "1.7.2",
-    desc: "Detects and recognizes printed English text. Outputs words with bounding boxes and confidence scores.",
-    status: "Active",
-  },
-  {
-    name: "LayoutLM",
-    role: "Document Understanding",
-    version: "v3-base",
-    desc: "Joint text + layout transformer for entity extraction (vendor, date, totals, line items).",
+    name: "Donut",
+    role: "End-to-end Document Understanding",
+    version: "base · CORD-finetuned",
+    desc: "OCR-free Swin encoder + BART decoder. Reads the receipt image directly and generates the structured CORD field tree — no separate OCR or layout stage.",
     status: "Active",
   },
   {
     name: "SQLite",
     role: "Local Persistence",
     version: "3.45",
-    desc: "Stores normalized extraction results. Fully on-device, no external service.",
+    desc: "Stores extraction results and human corrections (the retraining signal). Fully on-device, no external service.",
     status: "Active",
   },
 ];
@@ -70,14 +56,14 @@ function ModelsPage() {
   const perLabel = m?.per_label ?? [];
   const chartData = [...perLabel]
     .sort((a, b) => b.f1 - a.f1)
-    .map((l) => ({ label: l.label.replace(/^menu\./, "m."), f1: l.f1, full: l }));
+    .map((l) => ({ label: l.label, f1: l.f1, full: l }));
 
   return (
     <main className="max-w-7xl mx-auto px-6 py-8">
       <header className="mb-8">
         <h1 className="text-2xl font-semibold tracking-tight mb-1">Model Configuration</h1>
         <p className="text-sm text-muted-foreground">
-          Hybrid pipeline combining Computer Vision and Natural Language Processing. Entirely local
+          OCR-free, end-to-end receipt understanding with a fine-tuned Donut model. Entirely local
           and Open Source.
         </p>
       </header>
@@ -87,18 +73,18 @@ function ModelsPage() {
         <div className="flex items-end justify-between mb-4 flex-wrap gap-2">
           <div>
             <h2 className="text-lg font-semibold text-foreground tracking-tight">
-              LayoutLMv3 Evaluation
+              Donut Evaluation
             </h2>
             <p className="text-sm text-muted-foreground">
-              Token-level metrics on the held-out{" "}
-              <span className="font-mono">{m?.dataset ?? "CORD v2"}</span> {m?.split ?? "test"}{" "}
-              split.
+              Metrics on the held-out <span className="font-mono">{m?.dataset ?? "CORD v2"}</span>{" "}
+              {m?.split ?? "test"} — whole-receipt exact match, normalized Tree-Edit-Distance (the
+              Donut paper's structure metric), and per-field F1.
             </p>
           </div>
-          {m?.generated_at && (
+          {m?.num_receipts != null && (
             <span className="text-[11px] font-mono text-subtle">
-              {m.num_receipts} receipts · {m.num_tokens} tokens · evaluated{" "}
-              {new Date(m.generated_at).toLocaleString()}
+              {m.num_receipts} receipts
+              {m.generated_at ? ` · evaluated ${new Date(m.generated_at).toLocaleString()}` : ""}
             </span>
           )}
         </div>
@@ -119,12 +105,17 @@ function ModelsPage() {
         ) : (
           <>
             {/* Overall metric cards */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
               {[
-                { label: "Accuracy", value: m.overall?.accuracy, hint: "token-level" },
-                { label: "Macro F1", value: m.overall?.macro.f1, hint: "all classes equal" },
-                { label: "Weighted F1", value: m.overall?.weighted.f1, hint: "by frequency" },
+                { label: "Exact Match", value: m.overall?.accuracy, hint: "whole receipt" },
+                {
+                  label: "Tree Acc (1−nTED)",
+                  value: m.ted_accuracy ?? undefined,
+                  hint: "structure similarity",
+                },
                 { label: "Micro F1", value: m.overall?.micro.f1, hint: "global" },
+                { label: "Macro F1", value: m.overall?.macro.f1, hint: "fields equal" },
+                { label: "Weighted F1", value: m.overall?.weighted.f1, hint: "by field count" },
               ].map((s) => (
                 <div key={s.label} className="p-4 bg-panel rounded-xl ring-1 ring-border">
                   <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-1">
@@ -139,7 +130,7 @@ function ModelsPage() {
             <div className="grid grid-cols-12 gap-6 items-start">
               {/* Per-label F1 chart */}
               <div className="col-span-12 lg:col-span-7 bg-panel rounded-2xl ring-1 ring-border p-5">
-                <h3 className="text-sm font-semibold text-foreground mb-4">Per-label F1 score</h3>
+                <h3 className="text-sm font-semibold text-foreground mb-4">F1 by field group</h3>
                 <ResponsiveContainer width="100%" height={Math.max(360, chartData.length * 22)}>
                   <BarChart
                     data={chartData}
@@ -180,22 +171,22 @@ function ModelsPage() {
                   </BarChart>
                 </ResponsiveContainer>
                 <p className="text-[11px] text-subtle mt-3">
-                  Green ≥ 90% · amber ≥ 70% · red &lt; 70%. The long tail of rare classes (low
-                  support) is why macro-F1 ({pct(m.overall?.macro.f1)}) sits well below weighted-F1
-                  ({pct(m.overall?.weighted.f1)}).
+                  Green ≥ 90% · amber ≥ 70% · red &lt; 70%. F1 is computed per CORD field group
+                  (support = fields seen). The <span className="font-mono">menu</span> group is
+                  hardest — it bundles the most sub-fields (name, qty, unit price, price) per line.
                 </p>
               </div>
 
               {/* Per-label table */}
               <div className="col-span-12 lg:col-span-5 bg-panel rounded-2xl ring-1 ring-border overflow-hidden">
                 <div className="px-5 py-4 border-b border-border">
-                  <h3 className="text-sm font-semibold text-foreground">Per-label breakdown</h3>
+                  <h3 className="text-sm font-semibold text-foreground">Per-field breakdown</h3>
                 </div>
                 <div className="max-h-[520px] overflow-y-auto">
                   <table className="w-full text-left text-sm">
                     <thead className="sticky top-0 bg-panel">
                       <tr className="text-[10px] font-bold text-subtle uppercase tracking-wider border-b border-border">
-                        <th className="px-5 py-2">Label</th>
+                        <th className="px-5 py-2">Field</th>
                         <th className="px-2 py-2 text-right">P</th>
                         <th className="px-2 py-2 text-right">R</th>
                         <th className="px-2 py-2 text-right">F1</th>
